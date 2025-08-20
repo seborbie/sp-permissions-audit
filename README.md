@@ -7,6 +7,8 @@ It is well known that SharePoint permissions are notoriously difficult to manage
 -   Audit permissions for all sites in a SharePoint Online tenant - all the way down to list and library level.
 -   Capture permissions granted to Security (Entra ID) and Microsoft 365 groups.
 -   Uses a modern authentication flow that does not require a user to be logged in or have access to all sites in the tenant.
+-   Tracks per-user runtime and appends the total seconds to the CSV as a summary row.
+-   Optional transcript logging to a file via `-Log` (with `-AppendLog` support).
 
 ## 📝 Output
 
@@ -21,6 +23,9 @@ The script will output a CSV file with the following columns:
 | PermissionLevel   | The permission level granted to the SharePoint group, e.g full control, read, edit etc.           |
 | ListName          | The title of a list or library where the user has unique permissions.                             |
 | ListPermission    | The permission level granted to the user on the list or library.                                  |
+| TotalRuntimeSeconds | The total runtime (in seconds) for enumerating a user's permissions. Populated only in the final summary row for that user; null for other rows. |
+
+In addition to the detailed rows, the script appends a final summary row per user with `TotalRuntimeSeconds` populated and other fields left null.
 
 ## 🚀 Getting Started
 
@@ -55,13 +60,14 @@ The intention is for this script to be called by a parent script that will pass 
 Below is an example of how you might call the script.
 
 ```powershell
-# audit.ps1 - Create in the same directory as Get-SharePointOnlinePermissions.ps1
+# audit.ps1 - Create in the same directory as Get-SharePointTenantPermissions.ps1
 
 $tenantName = "contoso" # The name of your tenant, e.g. contoso.sharepoint.com
 $csvPath = "C:\temp\permissions.csv" # The path to the output CSV file
 $clientID = "00000000-0000-0000-0000-000000000000" # The client ID of the app registration
 $certificatePath = "C:\temp\certificate.pfx" # The path to the certificate file
 $append = $true # Should the script append to the CSV file or overwrite it?
+$logPath = "C:\logs\sp-permissions\audit.log" # Optional: transcript log path
 
 $users = @(
     "john@contoso.com",
@@ -69,10 +75,23 @@ $users = @(
 )
 
 foreach ($user in $users) {
-    .\Get-SharePointTenantPermissions.ps1 -TenantName $tenantName -CsvPath $csvPath -ClientID $clientID -CertificatePath $certificatePath -Append:$append -UserEmail $user
+    .\Get-SharePointTenantPermissions.ps1 `
+        -TenantName $tenantName `
+        -CsvPath $csvPath `
+        -ClientID $clientID `
+        -CertificatePath $certificatePath `
+        -Append:$append `
+        -UserEmail $user `
+        -Log $logPath `            # Optional: write output to a transcript log
+        -AppendLog                 # Optional: append to existing log instead of overwriting
 }
 
 ```
+
+### Optional logging
+
+-   **-Log <path>**: If supplied, the script starts a transcript and writes all output to the specified file (creating the directory if needed). If not supplied, output goes to the console as usual.
+-   **-AppendLog**: When used with `-Log`, appends to the existing log file. If omitted, any existing log file at the given path is overwritten.
 
 ## 🤝 Contributing
 
