@@ -1,7 +1,7 @@
 # Get-SharePointTenantPermissions.ps1
 # Description: This script will get all the permissions for a given user or users in a SharePoint Online tenant and export them to a CSV file.
 
-#requires -Modules PnP.PowerShell, MSAL.PS
+#requires -Modules MSAL.PS
 param (
     [Parameter(Mandatory = $true)]
     [string] $TenantName,
@@ -14,69 +14,120 @@ param (
     [Parameter(Mandatory = $true)]
     [string] $CertificatePath,
     [Parameter(Mandatory = $false)]
-    [SecureString] $CertificatePassword,
-    [Parameter(Mandatory = $false)]
-    [int] $ThrottleLimit = 12,
+    [securestring] $CertificatePassword,
     [Parameter(Mandatory = $false)]
     [switch] $Append = $false,
     [Parameter(Mandatory = $false)]
     [string] $Log,
     [Parameter(Mandatory = $false)]
-    [switch] $AppendLog
+    [switch] $AppendLog,
+    [Parameter(Mandatory = $false)]
+    [int] $ThrottleLimit = 1  # Number of parallel threads (increase to enable concurrent site processing)
 )
 
 # Start benchmarking for this user
 $scriptStartTime = Get-Date
 
-function Connect-TenantSite {
-    <#
-    .SYNOPSIS
-    Connects to a SharePoint Online site using certificate-based authentication via PnP PowerShell.
-    #>
-    param (
-        [Parameter(Mandatory = $true)]
-        [string] $SiteUrl
-    )
+# Console verbosity control: when -Log is supplied, keep console output minimal
+$ConsoleQuiet = $false
+if ($PSBoundParameters.ContainsKey('Log') -and $Log) { $ConsoleQuiet = $true }
 
-    $connectionAttempts = 3
-    for ($i = 0; $i -lt $connectionAttempts; $i++) {
-        try {
-            if ($CertificatePassword) {
-                Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -CertificatePath $CertificatePath -CertificatePassword $CertificatePassword -Tenant "$TenantName.onmicrosoft.com"
-            }
-            else {
-                Connect-PnPOnline -Url $SiteUrl -ClientId $ClientId -CertificatePath $CertificatePath -Tenant "$TenantName.onmicrosoft.com"
-            }
-            break
-        }
-        catch {
-            if ($i -eq $connectionAttempts - 1) {
-                Write-Error $_.Exception.Message
-                throw $_
-            }
-            continue
-        }
+# Buffer log lines when console is quiet to avoid file locking during execution
+$LogBuffer = $null
+if ($ConsoleQuiet -and $Log) {
+    $LogBuffer = New-Object System.Collections.ArrayList
+}
+
+function Write-Detail {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Message
+    )
+    if ($ConsoleQuiet -and $Log) { [void]$LogBuffer.Add($Message) } else { Write-Host $Message }
+}
+
+function Write-Major {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Message,
+        [Parameter(Mandatory = $false)] [System.ConsoleColor] $ForegroundColor
+    )
+    # Always show on console
+    if ($PSBoundParameters.ContainsKey('ForegroundColor') -and $null -ne $ForegroundColor) { Write-Host $Message -ForegroundColor $ForegroundColor } else { Write-Host $Message }
+    # Also capture in log when quiet mode is on
+    if ($ConsoleQuiet -and $Log) { [void]$LogBuffer.Add($Message) }
+}
+
+function Write-Warn {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Message
+    )
+    if ($ConsoleQuiet -and $Log) {
+        [void]$LogBuffer.Add("WARNING: $Message")
+    } else {
+        Write-Warning $Message
     }
 }
+
+ 
 
 function Get-GraphToken {
     <#
     .SYNOPSIS
     Gets a bearer token for the Microsoft Graph API using certificate-based authentication.
     #>
-    # Build certificate object from PFX, using password if provided
+    # Load the certificate, using the password if provided
     if ($CertificatePassword) {
-        $plainPassword = [System.Net.NetworkCredential]::new('', $CertificatePassword).Password
-        $certObject = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
+        $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+        try {
+            $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr)
+        }
+        finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr)
+        }
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
     }
     else {
-        $certObject = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
     }
 
     $connectionParameters = @{
         'TenantId'          = "$TenantName.onmicrosoft.com"
         'ClientId'          = $ClientId
-        'ClientCertificate' = $certObject
+        'ClientCertificate' = $certificate
+    }
+
+    try {
+        return Get-MsalToken @connectionParameters
+    }
+    catch {
+        Write-Error $_.Exception.Message
+        throw $_
+    }
+}
+
+function Get-SharePointAccessToken {
+    <#
+    .SYNOPSIS
+    Gets a bearer token for SharePoint REST using certificate-based authentication.
+    #>
+    if ($CertificatePassword) {
+        $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+        try {
+            $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr)
+        }
+        finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr)
+        }
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
+    }
+    else {
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+    }
+
+    $connectionParameters = @{
+        'TenantId'          = "$TenantName.onmicrosoft.com"
+        'ClientId'          = $ClientId
+        'ClientCertificate' = $certificate
+        'Scopes'            = "https://$TenantName.sharepoint.com/.default"
     }
 
     try {
@@ -110,9 +161,9 @@ function Get-UserGroupMembership {
         while ($groupMemberShipResponse.'@odata.nextLink') {
             $appendGroupMembershipResponse = Invoke-WebRequest -Uri $groupMemberShipResponse.'@odata.nextLink' -Method GET -Headers @{
                 Authorization = "Bearer $($accessToken.AccessToken)"
-            }
-            $graphGroupMembership.value += $appendGroupMembershipResponse.value
-            $graphGroupMembership.'@odata.nextLink' = $appendGroupMembershipResponse.'@odata.nextLink'
+            } | ConvertFrom-Json
+            $groupMemberShipResponse.value += $appendGroupMembershipResponse.value
+            $groupMemberShipResponse.'@odata.nextLink' = $appendGroupMembershipResponse.'@odata.nextLink'
         }
     }
     catch {
@@ -164,178 +215,161 @@ function New-CsvFile {
     Set-Content -Path $Path -Value $csvFile
 }
 
-function Test-UserIsSiteCollectionAdmin {
-    <#
-    .SYNOPSIS
-    Checks if a given user is a site collection admin for a given site collection.
-    #>
+function Invoke-SharePointRestWithAcceptFallback {
     param (
         [Parameter(Mandatory = $true)]
-        [string] $UserEmail,
+		[string] $Uri,
+		[Parameter(Mandatory = $true)]
+		[hashtable] $BaseHeaders,
+		[Parameter(Mandatory = $false)]
+		[string] $Method = 'GET',
         [Parameter(Mandatory = $false)]
-        [array] $GraphGroups
-    )
+		[object] $Body
+	)
 
-    $siteAdmins = Get-PnPSiteCollectionAdmin
-    foreach ($siteAdmin in $siteAdmins) {
-        $siteAdminLogin = $siteAdmin.LoginName.Split('|')[2]
+	$acceptCandidates = @(
+		'application/json;odata=nometadata',
+		'application/json;odata=minimalmetadata',
+		'application/json;odata=verbose',
+		'application/json',
+		''
+	)
 
-        if ($UserEmail -eq $siteAdminLogin) {
-            return $true
-        }
+	foreach ($accept in $acceptCandidates) {
+		$headers = @{}
+		foreach ($key in $BaseHeaders.Keys) {
+			if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] }
+		}
+		if ([string]::IsNullOrEmpty($accept)) {
+			if ($headers.ContainsKey('Accept')) { $headers.Remove('Accept') }
+		} else {
+			$headers['Accept'] = $accept
+		}
 
-        # Check if user is a member of a group that is a site collection admin
-        if ($null -ne $GraphGroups) {
-            if ($userGroupMembership.GroupId -contains $siteAdminLogin) {
-                return $true
-            }
-        }
-    }
+		try {
+			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+			} else {
+				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -ErrorAction Stop
+			}
+		}
+		catch {
+			$resp = $_.Exception.Response
+			$status = $null
+			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+			$shouldFallback = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+			if ($shouldFallback) { continue }
+			throw
+		}
+	}
 
-    return $false
+	throw "Received 406 Not Acceptable from $Uri for all Accept variants."
 }
 
-function Get-UserSharePointGroups {
+function Get-UserOneDriveSiteUrl {
     <#
     .SYNOPSIS
-    Returns an array of SharePoint groups that a given user is a member of for a given site collection.
+	Resolves the target user's OneDrive (personal site) root URL using Microsoft Graph.
     #>
     param (
         [Parameter(Mandatory = $true)]
-        [string] $UserEmail,
-        [Parameter(Mandatory = $false)]
-        [array] $GraphGroups
-    )
+		[string] $UserEmail
+	)
 
-    $siteGroups = Get-PnPGroup
+	$graphToken = Get-GraphToken
+	$encodedUserEmail = [System.Web.HttpUtility]::UrlEncode($UserEmail)
+	try {
+		$drive = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/users/$encodedUserEmail/drive" -Method GET -Headers @{ Authorization = "Bearer $($graphToken.AccessToken)" } | ConvertFrom-Json
+		$webUrl = $drive.webUrl
+		if ([string]::IsNullOrEmpty($webUrl)) { return $null }
+		# Typical format: https://{tenant}-my.sharepoint.com/personal/{normalized_upn}/Documents
+		$documentsIndex = $webUrl.IndexOf('/Documents', [StringComparison]::OrdinalIgnoreCase)
+		if ($documentsIndex -gt 0) {
+			return $webUrl.Substring(0, $documentsIndex)
+		}
+		# Fallback: return parent segment without trailing slash
+		return $webUrl.TrimEnd('/')
+	}
+	catch {
+		return $null
+	}
+}
 
-    $groupMembership = @()
-    foreach ($siteGroup in $siteGroups) {
-        $groupMembers = Get-PnPGroupMember -Identity $siteGroup.Title
+function Get-TenantSitesRest {
+    <#
+    .SYNOPSIS
+	Enumerates site collections using SharePoint Search REST and filters out other users' personal sites.
+    #>
+    param (
+        [Parameter(Mandatory = $true)]
+		[string] $UserEmail
+	)
 
-        foreach ($groupMember in $groupMembers) {
-            $groupMemberLogin = $groupMember.LoginName.Split('|')[2]
-            if ($UserEmail -eq $groupMemberLogin) {
-                $groupPermissionLevel = Get-PnPGroupPermissions -Identity $siteGroup
-                $permissionLevelString = ""
-                foreach ($permissionLevel in $groupPermissionLevel) {
-                    $permissionLevelString += $permissionLevel.Name + " | "
-                }
-
-                if ($permissionLevelString -eq "") {
-                    $permissionLevelString = "No Permissions"
+	# Build certificate
+	if ($CertificatePassword) {
+		$passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+		try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
+		$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
                 }
                 else {
-                    # remove trailing " | "
-                    $permissionLevelString = $permissionLevelString.Substring(0, $permissionLevelString.Length - 3)
-                }
+		$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+	}
 
-                $groupMembership += [PSCustomObject]@{
-                    GroupName       = $siteGroup.Title
-                    PermissionLevel = $permissionLevelString
-                }
+	$adminHost = "$TenantName-admin.sharepoint.com"
+	$spoToken = Get-MsalToken -TenantId "$TenantName.onmicrosoft.com" -ClientId $ClientId -ClientCertificate $certificate -Scopes "https://$adminHost/.default"
+	$headers = @{ Authorization = "Bearer $($spoToken.AccessToken)"; Accept = 'application/json;odata=nometadata' }
 
-            }
-            elseif ($null -ne $GraphGroups) {
-                if ($userGroupMembership.GroupId -contains $groupMemberLogin) {
-                    $groupPermissionLevel = Get-PnPGroupPermissions -Identity $siteGroup
-                    $permissionLevelString = ""
-                    foreach ($permissionLevel in $groupPermissionLevel) {
-                        $permissionLevelString += $permissionLevel.Name + " | "
-                    }
+	$startRow = 0
+	$rowLimit = 500
+	$allUrls = New-Object System.Collections.Generic.List[string]
 
-                    if ($permissionLevelString -eq "") {
-                        $permissionLevelString = "No Permissions"
-                    }
-                    else {
-                        # remove trailing " | "
-                        $permissionLevelString = $permissionLevelString.Substring(0, $permissionLevelString.Length - 3)
-                    }
+	do {
+		$uri = "https://$adminHost/_api/search/query?querytext='contentclass:STS_Site'&rowlimit=$rowLimit&startrow=$startRow&trimduplicates=false&selectproperties='Path'"
+		$response = Invoke-SharePointRestWithAcceptFallback -Uri $uri -BaseHeaders $headers -Method GET
+		$results = $response.PrimaryQueryResult.RelevantResults
+		if ($results -and $results.Table -and $results.Table.Rows) {
+			foreach ($row in $results.Table.Rows) {
+				$props = @{}
+				foreach ($cell in $row.Cells) { $props[$cell.Key] = $cell.Value }
+				if ($props.ContainsKey('Path') -and $props['Path']) {
+					[void]$allUrls.Add($props['Path'])
+				}
+			}
+		}
+		$startRow += $rowLimit
+	} while ($results -and $results.TotalRows -gt $startRow)
 
-                    $groupMembership += [PSCustomObject]@{
-                        GroupName       = $siteGroup.Title
-                        PermissionLevel = $permissionLevelString
-                    }
-                }
-            }
-        }
-    }
+	# Filter out other users' personal sites; keep only the current user's OneDrive
+	$uniqueUrls = $allUrls | Select-Object -Unique
+	$userOneDrive = Get-UserOneDriveSiteUrl -UserEmail $UserEmail
+	$tenantRoot = "https://$TenantName.sharepoint.com"
+	$myHost = "https://$TenantName-my.sharepoint.com"
 
-    return $groupMembership
-}
-
-function Get-UniqueListPermissions {
-    <#
-    .SYNOPSIS
-    Gets the unique permissions at the list level for a given user for a given site collection.
-    #>
-    param (
-        [Parameter(Mandatory = $true)]
-        [string] $UserEmail,
-        [Parameter(Mandatory = $false)]
-        [array] $GraphGroups
-    )
-
-    $ctx = Get-PnPContext
-    $web = $ctx.Web
-    $ctx.Load($web)
-    $ctx.ExecuteQuery()
-
-    $lists = $web.Lists
-    $ctx.Load($lists)
-    $ctx.ExecuteQuery()
-
-    # Exlude built-in lists
-    $excludedLists = @("App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", "Composed Looks", "Content and Structure Reports", "Content type publishing error log", "Converted Forms", "Device Channels", "Form Templates", "fpdatasources", "Get started with Apps for Office and SharePoint", "List Template Gallery", "Long Running Operation Status", "Maintenance Log Library", "Style Library", , "Master Docs", "Master Page Gallery", "MicroFeed", "NintexFormXml", "Quick Deploy Items", "Relationships List", "Reusable Content", "Search Config List", "Solution Gallery", "Site Collection Images", "Suggested Content Browser Locations", "TaxonomyHiddenList", "User Information List", "Web Part Gallery", "wfpub", "wfsvc", "Workflow History", "Workflow Tasks", "Preservation Hold Library", "SharePointHomeCacheList")
-    $siteListPermissions = @()
-    foreach ($list in $lists) {
-        $ctx.Load($list)
-        $ctx.ExecuteQuery()
-
-        if ($excludedLists -contains $list.Title) {
+	$filtered = @()
+	foreach ($u in $uniqueUrls) {
+		if ($u.StartsWith($tenantRoot, [StringComparison]::OrdinalIgnoreCase)) {
+			$filtered += $u
             continue
         }
+		if ($u.StartsWith($myHost, [StringComparison]::OrdinalIgnoreCase)) {
+			if ($null -ne $userOneDrive -and $u.StartsWith($userOneDrive, [StringComparison]::OrdinalIgnoreCase)) {
+				$filtered += $u
+			}
+			continue
+		}
+		# Exclude other hosts by default
+	}
 
-        $list.Retrieve("HasUniqueRoleAssignments")
-        $ctx.ExecuteQuery()
+	# Exclude content storage URLs
+	$filtered = $filtered | Where-Object { $_ -notmatch '/contentstorage' }
 
-        if ($list.HasUniqueRoleAssignments) {
-            $listPermissions = $list.RoleAssignments
-            $ctx.Load($listPermissions)
-            $ctx.ExecuteQuery()
-
-            foreach ($roleassignment in $listPermissions) {
-                $ctx.Load($roleassignment.Member)
-                $ctx.Load($roleassignment.RoleDefinitionBindings)
-                $ctx.ExecuteQuery()
-
-                if ($UserEmail -eq ($roleassignment.Member.LoginName.Split('|')[2])) {
-                    $listPermission = [PSCustomObject]@{
-                        Name            = $list.Title
-                        PermissionLevel = $roleassignment.RoleDefinitionBindings.Name
-                    }
-
-                    $siteListPermissions += $listPermission
-                }
-                elseif ($null -ne $GraphGroups) {
-                    if ( $GraphGroups.GroupId -contains ($roleassignment.Member.LoginName.Split('|')[2])) {
-                        $listPermission = [PSCustomObject]@{
-                            Name            = $list.Title
-                            PermissionLevel = $roleassignment.RoleDefinitionBindings.Name
-                        }
-
-                        $siteListPermissions += $listPermission
-                    }
-                }
-            }
-        }
-    }
-    return $siteListPermissions
+	return $filtered | ForEach-Object { [PSCustomObject]@{ Url = $_ } }
 }
 
+try {
 Set-Location $PSScriptRoot
 
-# Initialize optional transcript logging
+# Initialize optional logging file (no transcript to avoid lock when writing custom logs)
 $transcriptStarted = $false
 if ($PSBoundParameters.ContainsKey('Log') -and $Log) {
     try {
@@ -348,253 +382,404 @@ if ($PSBoundParameters.ContainsKey('Log') -and $Log) {
             Remove-Item -LiteralPath $Log -Force -ErrorAction SilentlyContinue
         }
 
-        Start-Transcript -Path $Log -Append:$AppendLog -Force | Out-Null
-        $transcriptStarted = $true
+        # Create file if it doesn't exist
+        if (-not (Test-Path -LiteralPath $Log)) { New-Item -ItemType File -Path $Log -Force | Out-Null }
     }
     catch {
-        Write-Warning "Failed to start transcript at '$Log': $($_.Exception.Message)"
+        Write-Warn "Failed to prepare log file at '$Log': $($_.Exception.Message)"
     }
 }
 
-Write-Host "$(Get-Date) INFO: Connecting to tenant admin site..."
-Connect-TenantSite -SiteUrl "https://$TenantName-admin.sharepoint.com" -ErrorAction Stop
+Write-Major "$(Get-Date) INFO: Starting processing for $UserEmail..." -ForegroundColor Green
+Write-Detail "$(Get-Date) INFO: Connecting to tenant admin site..."
+Write-Detail "$(Get-Date) INFO: Getting all site collections via Search REST..."
+$siteCollections = Get-TenantSitesRest -UserEmail $UserEmail -ErrorAction Stop
+Write-Detail "$(Get-Date) INFO: `tFound $($siteCollections.Count) site collections."
 
-Write-Host "$(Get-Date) INFO: Getting all site collections..."
-$siteCollections = Get-PnPTenantSite -ErrorAction Stop
-Write-Host "$(Get-Date) INFO: `tFound $($siteCollections.Count) site collections."
-Disconnect-PnPOnline
-
-Write-Host "$(Get-Date) INFO: Getting group membership for $UserEmail..."
+Write-Detail "$(Get-Date) INFO: Getting group membership for $UserEmail..."
 $userGroupMembership = Get-UserGroupMembership -UserEmail $UserEmail -ErrorAction Stop
-Write-Host "$(Get-Date) INFO: `tFound $($userGroupMembership.Count) groups."
+Write-Detail "$(Get-Date) INFO: `tFound $($userGroupMembership.Count) groups."
 
 if (!$Append) {
     New-CsvFile -Path $CSVPath
 }
 
-# Prepare inputs for parallel processing
-$excludedListsForParallel = @(
-    "App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", "Composed Looks",
-    "Content and Structure Reports", "Content type publishing error log", "Converted Forms", "Device Channels",
-    "Form Templates", "fpdatasources", "Get started with Apps for Office and SharePoint", "List Template Gallery",
-    "Long Running Operation Status", "Maintenance Log Library", "Style Library", , "Master Docs", "Master Page Gallery",
-    "MicroFeed", "NintexFormXml", "Quick Deploy Items", "Relationships List", "Reusable Content", "Search Config List",
-    "Solution Gallery", "Site Collection Images", "Suggested Content Browser Locations", "TaxonomyHiddenList",
-    "User Information List", "Web Part Gallery", "wfpub", "wfsvc", "Workflow History", "Workflow Tasks",
-    "Preservation Hold Library", "SharePointHomeCacheList"
-)
+# Create progress tracking
+$totalSites = $siteCollections.Count
 
-# Convert certificate password once for runspaces
-$certPasswordPlain = $null
-if ($CertificatePassword) {
-    $certPasswordPlain = [System.Net.NetworkCredential]::new('', $CertificatePassword).Password
+# Concurrency messaging (REST-based implementation supports parallel processing)
+if ($ThrottleLimit -gt 1) {
+    Write-Detail "$(Get-Date) INFO: Processing $totalSites sites with $ThrottleLimit parallel threads..."
+} else {
+    Write-Detail "$(Get-Date) INFO: Processing $totalSites sites sequentially..."
 }
 
-# Read certificate bytes once to avoid concurrent file handle issues in runspaces
-$certBytes = [System.IO.File]::ReadAllBytes($CertificatePath)
-$certBase64 = [System.Convert]::ToBase64String($certBytes)
+# Create synchronized hashtable for thread-safe operations
+$syncHash = [hashtable]::Synchronized(@{
+    ProcessedCount = 0
+    TotalCount = $totalSites
+    LogLines = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+})
 
-Write-Host "$(Get-Date) INFO: Processing $($siteCollections.Count) sites in parallel..."
+# Process sites in parallel for improved performance
+$parallelResults = $siteCollections | ForEach-Object -Parallel {
+    # Import required modules in each parallel runspace
+    Import-Module MSAL.PS -ErrorAction SilentlyContinue
+    
+    function Invoke-SharePointRestWithAcceptFallback {
+    	param (
+    		[Parameter(Mandatory = $true)]
+    		[string] $Uri,
+    		[Parameter(Mandatory = $true)]
+    		[hashtable] $BaseHeaders,
+    		[Parameter(Mandatory = $false)]
+    		[string] $Method = 'GET',
+    		[Parameter(Mandatory = $false)]
+    		[object] $Body
+    	)
+    
+    	$acceptCandidates = @(
+    		'application/json;odata=nometadata',
+    		'application/json;odata=minimalmetadata',
+    		'application/json;odata=verbose',
+    		'application/json',
+    		''
+    	)
+    
+    	foreach ($accept in $acceptCandidates) {
+    		$headers = @{}
+    		foreach ($key in $BaseHeaders.Keys) {
+    			if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] }
+    		}
+    		if ([string]::IsNullOrEmpty($accept)) {
+    			if ($headers.ContainsKey('Accept')) { $headers.Remove('Accept') }
+    		} else {
+    			$headers['Accept'] = $accept
+    		}
+    
+    		try {
+    			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+    			} else {
+    				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -ErrorAction Stop
+    			}
+    		}
+    		catch {
+    			$resp = $_.Exception.Response
+    			$status = $null
+    			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+    			$shouldFallback = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+    			if ($shouldFallback) { continue }
+    			throw
+    		}
+    	}
+    
+    	throw "Received 406 Not Acceptable from $Uri for all Accept variants."
+    }
 
-<# no SPO token required; each runspace authenticates with cert #>
-
-$graphGroupIds = $userGroupMembership.GroupId
-
-$allSiteRows = $siteCollections | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-    $site = $PSItem
-
+    $site = $_
+    $localResults = @()
+    
+    # Import variables from parent scope
+    $localTenantName = $using:TenantName
+    $localClientId = $using:ClientId
+    $localCertPath = $using:CertificatePath
+    $localCertPassword = $using:CertificatePassword
+    $localUserEmail = $using:UserEmail
+    $localUserGroups = $using:userGroupMembership
+    $sync = $using:syncHash
+    $localThrottleLimit = $using:ThrottleLimit
+    $localIsQuiet = $using:ConsoleQuiet
+    $localLog = $using:Log
+    $localLogBuffer = $using:LogBuffer
+    
+    # Increment and get the current count
+    $sync.ProcessedCount++
+    $currentIndex = $sync.ProcessedCount
+    
     try {
-        Import-Module PnP.PowerShell -ErrorAction Stop | Out-Null
-    }
-    catch {
-        Write-Error "Failed to import PnP.PowerShell in parallel block: $($_.Exception.Message)"
-        return
-    }
-
-    function Invoke-WithRetry {
-        param(
-            [Parameter(Mandatory = $true)] [scriptblock] $Action,
-            [int] $MaxAttempts = 6,
-            [int] $InitialDelayMs = 500,
-            [string] $OperationName = '',
-            [string] $SiteUrlForLog = ''
-        )
-
-        $attempt = 0
-        while ($true) {
-            try {
-                return & $Action
-            }
-            catch {
-                $attempt++
-                $message = $_.Exception.Message
-                $isThrottled = (
-                    $message -match '429' -or
-                    $message -match 'Too Many Requests' -or
-                    $message -match '503' -or
-                    $message -match 'Service Unavailable' -or
-                    $message -match 'not signed in' -or
-                    $message -match 'm_safeCertContext is an invalid handle'
-                )
-                if (-not $isThrottled -or $attempt -ge $MaxAttempts) {
-                    throw
-                }
-
-                $delay = [math]::Min(30000, $InitialDelayMs * [math]::Pow(2, $attempt - 1))
-                $jitter = Get-Random -Minimum ($delay * 0.9) -Maximum ($delay * 1.1)
-                Write-Warning ("{0} THROTTLED: site={1} op={2} attempt={3} delayMs={4} msg={5}" -f (Get-Date), $SiteUrlForLog, $OperationName, $attempt, [int]$jitter, $message)
-                Start-Sleep -Milliseconds [int]$jitter
-            }
+        # Detailed per-site progress: log-only when -Log was supplied
+        if ($localIsQuiet -and $localLog) {
+            [void]$sync.LogLines.Add("$(Get-Date) INFO: Processing $($site.Url) ($currentIndex of $($sync.TotalCount))...")
+        } else {
+            Write-Host "$(Get-Date) INFO: Processing $($site.Url) ($currentIndex of $($sync.TotalCount))..."
         }
-    }
-
-    # Connect per-site using cert auth (base64-encoded PFX)
-    try {
-        $connection = Invoke-WithRetry -Action {
-            if ($using:certPasswordPlain) {
-                Connect-PnPOnline -Url $site.Url -ClientId $using:ClientId -CertificateBase64Encoded $using:certBase64 -CertificatePassword (ConvertTo-SecureString $using:certPasswordPlain -AsPlainText -Force) -Tenant "$($using:TenantName).onmicrosoft.com" -ReturnConnection
-            }
-            else {
-                Connect-PnPOnline -Url $site.Url -ClientId $using:ClientId -CertificateBase64Encoded $using:certBase64 -Tenant "$($using:TenantName).onmicrosoft.com" -ReturnConnection
-            }
-        } -OperationName "Connect" -SiteUrlForLog $site.Url
-    }
-    catch {
-        Write-Warning "Failed to connect to $($site.Url): $($_.Exception.Message)"
-        return
-    }
-
-    $rows = @()
-
-    try {
-        # 1) Site collection admin check
+        
+        # Check if user is site collection admin via SharePoint REST
         $isSiteAdmin = $false
-        $siteAdmins = Invoke-WithRetry -Action { Get-PnPSiteCollectionAdmin -Connection $connection } -OperationName "Get-PnPSiteCollectionAdmin" -SiteUrlForLog $site.Url
-        foreach ($siteAdmin in $siteAdmins) {
-            $siteAdminLogin = $siteAdmin.LoginName.Split('|')[2]
-            if ($using:UserEmail -eq $siteAdminLogin -or ($using:graphGroupIds -contains $siteAdminLogin)) {
-                $isSiteAdmin = $true
-                break
-            }
-        }
-
-        if ($isSiteAdmin) {
-            $rows += [PSCustomObject]@{
-                UserPrincipalName   = $using:UserEmail
-                SiteUrl             = $site.Url
-                SiteAdmin           = $true
-                GroupName           = $null
-                PermissionLevel     = $null
-                ListName            = $null
-                ListPermission      = $null
-                TotalRuntimeSeconds = $null
+        try {
+            # Build certificate in this runspace
+            if ($localCertPassword) {
+                $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
+                try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
+                $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPassword)
+            } else {
+                $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
             }
 
-            return $rows
-        }
+            # Acquire SharePoint token (app-only)
+            $spoToken = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificate -Scopes "https://$localTenantName.sharepoint.com/.default"
+            $headers = @{ Authorization = "Bearer $($spoToken.AccessToken)"; Accept = 'application/json;odata=nometadata' }
 
-        # 2) SharePoint group membership check
-        $siteGroups = Invoke-WithRetry -Action { Get-PnPGroup -Connection $connection } -OperationName "Get-PnPGroup" -SiteUrlForLog $site.Url
-        foreach ($siteGroup in $siteGroups) {
-            try {
-                $groupMembers = Invoke-WithRetry -Action { Get-PnPGroupMember -Identity $siteGroup.Title -Connection $connection } -OperationName ("Get-PnPGroupMember:{0}" -f $siteGroup.Title) -SiteUrlForLog $site.Url
+            # Retrieve site admins
+            $adminsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/siteusers?`$filter=IsSiteAdmin%20eq%20true") -BaseHeaders $headers -Method GET
+            $admins = @()
+            if ($adminsResponse) {
+                if ($adminsResponse.value) { $admins = $adminsResponse.value } else { $admins = @($adminsResponse) }
             }
-            catch {
-                if ($_.Exception.Message -match 'Group cannot be found') { continue }
-                throw
-            }
-            foreach ($groupMember in $groupMembers) {
-                $groupMemberLogin = $groupMember.LoginName.Split('|')[2]
-                if ($using:UserEmail -eq $groupMemberLogin -or ($using:graphGroupIds -contains $groupMemberLogin)) {
-                    $groupPermissionLevel = Invoke-WithRetry -Action { Get-PnPGroupPermissions -Identity $siteGroup -Connection $connection } -OperationName ("Get-PnPGroupPermissions:{0}" -f $siteGroup.Title) -SiteUrlForLog $site.Url
-                    $permissionLevelString = if ($groupPermissionLevel) { ($groupPermissionLevel | ForEach-Object { $_.Name }) -join ' | ' } else { 'No Permissions' }
 
-                    $rows += [PSCustomObject]@{
-                        UserPrincipalName   = $using:UserEmail
-                        SiteUrl             = $site.Url
-                        SiteAdmin           = $false
-                        GroupName           = $siteGroup.Title
-                        PermissionLevel     = $permissionLevelString
-                        ListName            = $null
-                        ListPermission      = $null
-                        TotalRuntimeSeconds = $null
+            foreach ($admin in $admins) {
+                $adminLogin = $admin.LoginName
+                if ($adminLogin -match '\|') { $adminLogin = $adminLogin.Split('|')[-1] }
+
+                if ($localUserEmail -eq $adminLogin -or ($null -ne $admin.Email -and $localUserEmail -eq $admin.Email) -or ($null -ne $localUserGroups -and $localUserGroups.GroupId -contains $adminLogin)) {
+                    $isSiteAdmin = $true
+                    if ($localIsQuiet -and $localLog) {
+                        [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail is a site collection admin for $($site.Url).")
+                    } else {
+                        Write-Host "$(Get-Date) INFO: `t$localUserEmail is a site collection admin for $($site.Url)."
                     }
-
+                    $localResults += [PSCustomObject]@{
+                        UserPrincipalName = $localUserEmail
+                        SiteUrl           = $site.Url
+            SiteAdmin         = $true
+            GroupName         = $null
+            PermissionLevel   = $null
+            ListName          = $null
+            ListPermission    = $null
+            TotalRuntimeSeconds = $null
+        }
                     break
                 }
             }
         }
+        catch {
+            if ($localIsQuiet -and $localLog) {
+                [void]$sync.LogLines.Add("WARNING: Error checking site admin status for $($site.Url): $_")
+            } else {
+                Write-Warning "Error checking site admin status for $($site.Url): $_"
+            }
+        }
+        
+        if (-not $isSiteAdmin) {
+            # Check SharePoint groups
+            try {
+                # Retrieve site groups via SharePoint REST
+                if ($localCertPassword) {
+                    $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
+                    try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
+                    $certificateGroups = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPassword)
+                } else {
+                    $certificateGroups = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
+                }
+                $spoTokenGroups = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificateGroups -Scopes "https://$localTenantName.sharepoint.com/.default"
+                $headersGroups = @{ Authorization = "Bearer $($spoTokenGroups.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+                $groupsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/sitegroups") -BaseHeaders $headersGroups -Method GET
+                $siteGroups = @()
+                if ($groupsResponse) { if ($groupsResponse.value) { $siteGroups = $groupsResponse.value } else { $siteGroups = @($groupsResponse) } }
+                foreach ($group in $siteGroups) {
+                    try {
+                        # Skip system groups that might cause issues
+                        if ($group.Title -match "Limited Access|SharingLinks\.|_catalog") {
+        continue
+    }
 
-        # 3) Unique list-level permissions
-        $ctx = Get-PnPContext -Connection $connection
-        $web = $ctx.Web
-        $ctx.Load($web)
-        Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName "CSOM:LoadWeb" -SiteUrlForLog $site.Url | Out-Null
-
-        $lists = $web.Lists
-        $ctx.Load($lists)
-        Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName "CSOM:LoadLists" -SiteUrlForLog $site.Url | Out-Null
-
-        foreach ($list in $lists) {
-            $ctx.Load($list)
-            Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName ("CSOM:LoadList:{0}" -f $list.Title) -SiteUrlForLog $site.Url | Out-Null
-
-            if ($using:excludedListsForParallel -contains $list.Title) { continue }
-
-            $list.Retrieve("HasUniqueRoleAssignments")
-            Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName ("CSOM:HasUniqueRoleAssignments:{0}" -f $list.Title) -SiteUrlForLog $site.Url | Out-Null
-
-            if ($list.HasUniqueRoleAssignments) {
-                $listPermissions = $list.RoleAssignments
-                $ctx.Load($listPermissions)
-                Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName ("CSOM:LoadRoleAssignments:{0}" -f $list.Title) -SiteUrlForLog $site.Url | Out-Null
-
-                foreach ($roleassignment in $listPermissions) {
-                    $ctx.Load($roleassignment.Member)
-                    $ctx.Load($roleassignment.RoleDefinitionBindings)
-                    Invoke-WithRetry -Action { $ctx.ExecuteQuery() } -OperationName ("CSOM:LoadAssignment:{0}" -f $list.Title) -SiteUrlForLog $site.Url | Out-Null
-
-                    $loginToCheck = $roleassignment.Member.LoginName.Split('|')[2]
-                    if ($using:UserEmail -eq $loginToCheck -or ($using:graphGroupIds -contains $loginToCheck)) {
-                        $rows += [PSCustomObject]@{
-                            UserPrincipalName   = $using:UserEmail
-                            SiteUrl             = $site.Url
-                            SiteAdmin           = $false
-                            GroupName           = $null
-                            PermissionLevel     = $null
-                            ListName            = $list.Title
-                            ListPermission      = $roleassignment.RoleDefinitionBindings.Name
-                            TotalRuntimeSeconds = $null
+                        # Retrieve members via SharePoint REST
+                        $membersResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/sitegroups/getbyid($($group.Id))/users") -BaseHeaders $headersGroups -Method GET
+                        $groupMembers = @()
+                        if ($membersResponse) { if ($membersResponse.value) { $groupMembers = $membersResponse.value } else { $groupMembers = @($membersResponse) } }
+                        $userIsInGroup = $false
+                        
+                        foreach ($member in $groupMembers) {
+                            if ($member.LoginName -match '\|') {
+                                $memberLogin = $member.LoginName.Split('|')[-1]
+                            } else {
+                                $memberLogin = $member.LoginName
+                            }
+                            
+                            if ($localUserEmail -eq $memberLogin -or ($null -ne $localUserGroups -and $localUserGroups.GroupId -contains $memberLogin)) {
+                                $userIsInGroup = $true
+                                break
+                            }
                         }
-                        break
+                        
+                        if ($userIsInGroup) {
+                            # Retrieve group permissions via SharePoint REST
+                            $bindingsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/roleassignments/getbyprincipalid($($group.Id))/roledefinitionbindings") -BaseHeaders $headersGroups -Method GET
+                            $permissions = @()
+                            if ($bindingsResponse) { if ($bindingsResponse.value) { $permissions = $bindingsResponse.value } else { $permissions = @($bindingsResponse) } }
+                            $permString = ""
+                            foreach ($perm in $permissions) {
+                                $permString += $perm.Name + " | "
+                            }
+                            
+                            if ($permString -eq "") {
+                                $permString = "No Permissions"
+                            } else {
+                                $permString = $permString.Substring(0, $permString.Length - 3)
+                            }
+                            
+                            if ($localIsQuiet -and $localLog) {
+                                [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail is a member of $($group.Title) with $permString permissions.")
+                            } else {
+                                Write-Host "$(Get-Date) INFO: `t$localUserEmail is a member of $($group.Title) with $permString permissions."
+                            }
+                            $localResults += [PSCustomObject]@{
+                                UserPrincipalName = $localUserEmail
+                                SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                GroupName         = $group.Title
+                                PermissionLevel   = $permString
+                ListName          = $null
+                ListPermission    = $null
+                TotalRuntimeSeconds = $null
+            }
+                        }
+                    }
+                    catch {
+                        if ($localIsQuiet -and $localLog) {
+                            [void]$sync.LogLines.Add("WARNING: Error processing group $($group.Title): $_")
+                        } else {
+                            Write-Warning "Error processing group $($group.Title): $_"
+                        }
                     }
                 }
             }
+            catch {
+                if ($localIsQuiet -and $localLog) {
+                    [void]$sync.LogLines.Add("WARNING: Error getting site groups for $($site.Url): $_")
+                } else {
+                    Write-Warning "Error getting site groups for $($site.Url): $_"
+                }
+            }
+            
+            # Check list permissions
+            try {
+                # Build certificate and headers for REST calls
+                if ($localCertPassword) {
+                    $passwordBstrLists = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
+                    try { $plainPasswordLists = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstrLists) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstrLists) }
+                    $certificateLists = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPasswordLists)
+                } else {
+                    $certificateLists = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
+                }
+                $spoTokenLists = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificateLists -Scopes "https://$localTenantName.sharepoint.com/.default"
+                $headersLists = @{ Authorization = "Bearer $($spoTokenLists.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+
+                $excludedLists = @("App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", 
+                    "Composed Looks", "Content and Structure Reports", "Content type publishing error log", 
+                    "Converted Forms", "Device Channels", "Form Templates", "fpdatasources", 
+                    "Get started with Apps for Office and SharePoint", "List Template Gallery", 
+                    "Long Running Operation Status", "Maintenance Log Library", "Style Library", 
+                    "Master Docs", "Master Page Gallery", "MicroFeed", "NintexFormXml", 
+                    "Quick Deploy Items", "Relationships List", "Reusable Content", 
+                    "Search Config List", "Solution Gallery", "Site Collection Images", 
+                    "Suggested Content Browser Locations", "TaxonomyHiddenList", 
+                    "User Information List", "Web Part Gallery", "wfpub", "wfsvc", 
+                    "Workflow History", "Workflow Tasks", "Preservation Hold Library", 
+                    "SharePointHomeCacheList")
+
+                # Get lists with HasUniqueRoleAssignments flag
+                $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists?`$select=Id,Title,HasUniqueRoleAssignments&`$top=5000") -BaseHeaders $headersLists -Method GET
+                $lists = @()
+                if ($listsResponse) { if ($listsResponse.value) { $lists = $listsResponse.value } else { $lists = @($listsResponse) } }
+
+                foreach ($list in $lists) {
+                    try {
+                        if ($excludedLists -contains $list.Title) { continue }
+                        if (-not $list.HasUniqueRoleAssignments) { continue }
+
+                        # Get role assignments for the list
+                        $assignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists(guid'$($list.Id)')/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headersLists -Method GET
+                        $assignments = @()
+                        if ($assignmentsResponse) { if ($assignmentsResponse.value) { $assignments = $assignmentsResponse.value } else { $assignments = @($assignmentsResponse) } }
+
+                        foreach ($roleAssignment in $assignments) {
+                            $memberLogin = $roleAssignment.Member.LoginName
+                            if ($memberLogin -match '\\|') { $memberLogin = $memberLogin.Split('|')[-1] }
+
+                            if ($localUserEmail -eq $memberLogin -or ($null -ne $localUserGroups -and $localUserGroups.GroupId -contains $memberLogin)) {
+                                $permissionNames = @()
+                                foreach ($binding in $roleAssignment.RoleDefinitionBindings) { $permissionNames += $binding.Name }
+                                $permissionString = $permissionNames -join " | "
+
+                                if ($localIsQuiet -and $localLog) {
+                                    [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail has $permissionString permissions on $($list.Title).")
+                                } else {
+                                    Write-Host "$(Get-Date) INFO: `t$localUserEmail has $permissionString permissions on $($list.Title)."
+                                }
+                                $localResults += [PSCustomObject]@{
+                                    UserPrincipalName = $localUserEmail
+                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                GroupName         = $null
+                PermissionLevel   = $null
+                                    ListName          = $list.Title
+                                    ListPermission    = $permissionString
+                TotalRuntimeSeconds = $null
+            }
+                            }
+                        }
+                    }
+                    catch {
+                        # Silently skip lists that cause errors (could be system lists)
+                        continue
+                    }
+                }
+            }
+            catch {
+                if ($localIsQuiet -and $localLog) {
+                    [void]$sync.LogLines.Add("WARNING: Error checking list permissions for $($site.Url): $_")
+                } else {
+                    Write-Warning "Error checking list permissions for $($site.Url): $_"
+                }
+            }
         }
+        
+        # No PnP disconnect needed
     }
     catch {
-        Write-Warning "Failed processing $($site.Url): $($_.Exception.Message)"
+        if ($localIsQuiet -and $localLog) {
+            [void]$sync.LogLines.Add("WARNING: Error processing site $($site.Url): $($_.Exception.Message)")
+        } else {
+            Write-Warning "Error processing site $($site.Url): $($_.Exception.Message)"
+        }
     }
-    finally {
-        try { Disconnect-PnPOnline -Connection $connection | Out-Null } catch { }
-    }
+    
+    # Return results from this parallel iteration
+    $localResults
+    
+} -ThrottleLimit $ThrottleLimit
 
-    return $rows
-
+# Flush buffered detailed log lines to the log file (single write) if quiet mode is enabled
+if ($ConsoleQuiet -and $Log -and ($syncHash.LogLines.Count -gt 0 -or $LogBuffer.Count -gt 0)) {
+    try {
+        # Write buffered detail lines from parallel runspaces in one operation
+        $combined = New-Object System.Collections.Generic.List[string]
+        if ($LogBuffer.Count -gt 0) { $combined.AddRange([string[]]$LogBuffer) }
+        if ($syncHash.LogLines.Count -gt 0) { $combined.AddRange([string[]]$syncHash.LogLines) }
+        if ($combined.Count -gt 0) {
+            $all = ($combined.ToArray()) -join [Environment]::NewLine
+            [System.IO.File]::AppendAllText($Log, $all + [Environment]::NewLine)
+        }
+        # reset local buffer for subsequent major messages
+        if ($LogBuffer) { $LogBuffer.Clear() | Out-Null }
+    } catch { }
 }
 
-# Flatten results and write once
-$rowsToWrite = @()
-if ($allSiteRows) { $rowsToWrite += $allSiteRows }
-if ($rowsToWrite.Count -gt 0) {
-    $rowsToWrite | Export-Csv -Path $CSVPath -Append -NoTypeInformation
+# Write all results to CSV
+Write-Major "$(Get-Date) INFO: Writing results to CSV..."
+foreach ($result in $parallelResults) {
+    if ($result) {
+        $result | Export-Csv -Path $CSVPath -Append -NoTypeInformation
+    }
 }
 
 # Append total runtime summary row for this user
 $scriptEndTime = Get-Date
 $elapsed = $scriptEndTime - $scriptStartTime
 $totalSeconds = [math]::Round($elapsed.TotalSeconds, 2)
-Write-Host "$(Get-Date) INFO: Total runtime for $($UserEmail): $($totalSeconds) seconds."
+Write-Major "$(Get-Date) INFO: Total runtime for $($UserEmail): $($totalSeconds) seconds."
 
 $csvLineObject = [PSCustomObject]@{
     UserPrincipalName   = $UserEmail
@@ -610,4 +795,18 @@ $csvLineObject | Export-Csv -Path $CSVPath -Append -NoTypeInformation
 
 if ($transcriptStarted) {
     try { Stop-Transcript | Out-Null } catch { }
+}
+
+# Final flush for any remaining major messages
+if ($ConsoleQuiet -and $Log -and $LogBuffer -and $LogBuffer.Count -gt 0) {
+    try {
+        $tail = ([string[]]$LogBuffer) -join [Environment]::NewLine
+        [System.IO.File]::AppendAllText($Log, $tail + [Environment]::NewLine)
+        $LogBuffer.Clear() | Out-Null
+    } catch { }
+}
+}
+catch {
+    Write-Warn "Skipping user '$UserEmail' due to error: $($_.Exception.Message)"
+    return
 }
