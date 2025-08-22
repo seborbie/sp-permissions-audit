@@ -22,7 +22,9 @@ param (
     [Parameter(Mandatory = $false)]
     [switch] $AppendLog,
     [Parameter(Mandatory = $false)]
-    [int] $ThrottleLimit = 1  # Number of parallel threads (increase to enable concurrent site processing)
+    [int] $ThrottleLimit = 1,  # Number of parallel threads (increase to enable concurrent site processing)
+    [Parameter(Mandatory = $false)]
+    [int] $Max406Retries = 999
 )
 
 # Start benchmarking for this user
@@ -227,43 +229,73 @@ function Invoke-SharePointRestWithAcceptFallback {
 		[object] $Body
 	)
 
-	$acceptCandidates = @(
-		'application/json;odata=nometadata',
-		'application/json;odata=minimalmetadata',
-		'application/json;odata=verbose',
-		'application/json',
-		''
-	)
+	# Start with pinned nometadata for highest performance (except Search)
+	$headers = @{}
+	foreach ($key in $BaseHeaders.Keys) { if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] } }
 
-	foreach ($accept in $acceptCandidates) {
-		$headers = @{}
-		foreach ($key in $BaseHeaders.Keys) {
-			if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] }
-		}
-		if ([string]::IsNullOrEmpty($accept)) {
-			if ($headers.ContainsKey('Accept')) { $headers.Remove('Accept') }
-		} else {
-			$headers['Accept'] = $accept
-		}
-
-		try {
-			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-			} else {
-				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -ErrorAction Stop
+	$uriWithFormat = $Uri
+	$isSearch = $Uri -match '/_api/search/'
+	if ($isSearch) {
+		# Search API: do NOT append $format. Retry 406s up to Max406Retries rotating Accept variants
+		$accepts = @('application/json', 'application/json;odata=minimalmetadata', 'application/json;odata=verbose', '*/*', '')
+		$attempt = 0
+		while ($attempt -le $Max406Retries) {
+			$accept = $accepts[$attempt % $accepts.Count]
+			$variantHeaders = @{}
+			foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+			if ([string]::IsNullOrEmpty($accept)) { if ($variantHeaders.ContainsKey('Accept')) { $variantHeaders.Remove('Accept') } } else { $variantHeaders['Accept'] = $accept }
+			try {
+				if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+					return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+				} else {
+					return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+				}
+			}
+			catch {
+				$resp = $_.Exception.Response
+				$status = $null
+				if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+				$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+				if (-not $shouldNext) { throw }
+				$attempt++
+				continue
 			}
 		}
-		catch {
-			$resp = $_.Exception.Response
-			$status = $null
-			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
-			$shouldFallback = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
-			if ($shouldFallback) { continue }
-			throw
-		}
+		throw "Received 406 Not Acceptable from $Uri after $Max406Retries retries."
 	}
 
-	throw "Received 406 Not Acceptable from $Uri for all Accept variants."
+	# Non-Search: use OData nometadata and ensure $format matches
+	$headers['Accept'] = 'application/json;odata=nometadata'
+	if ($uriWithFormat -match '(\?|&)`?\$format=') {
+		$uriWithFormat = $uriWithFormat -replace '(\?|&)\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
+	} else {
+		$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+		$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+	}
+
+	try {
+		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+		} else {
+			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
+		}
+	}
+	catch {
+		$resp = $_.Exception.Response
+		$status = $null
+		if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+		$shouldRetryMinimal = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+		if (-not $shouldRetryMinimal) { throw }
+
+		# Retry once with minimalmetadata only
+		$headers['Accept'] = 'application/json;odata=minimalmetadata'
+		$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
+		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+		} else {
+			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
+		}
+	}
 }
 
 function Get-UserOneDriveSiteUrl {
@@ -341,9 +373,13 @@ function Get-TenantSitesRest {
 
 	# Filter out other users' personal sites; keep only the current user's OneDrive
 	$uniqueUrls = $allUrls | Select-Object -Unique
-	$userOneDrive = Get-UserOneDriveSiteUrl -UserEmail $UserEmail
 	$tenantRoot = "https://$TenantName.sharepoint.com"
 	$myHost = "https://$TenantName-my.sharepoint.com"
+	# Only resolve OneDrive if at least one URL is on the -my host
+	$userOneDrive = $null
+	$hasMyHostUrl = $false
+	foreach ($u in $uniqueUrls) { if ($u.StartsWith($myHost, [StringComparison]::OrdinalIgnoreCase)) { $hasMyHostUrl = $true; break } }
+	if ($hasMyHostUrl) { $userOneDrive = Get-UserOneDriveSiteUrl -UserEmail $UserEmail }
 
 	$filtered = @()
 	foreach ($u in $uniqueUrls) {
@@ -364,6 +400,199 @@ function Get-TenantSitesRest {
 	$filtered = $filtered | Where-Object { $_ -notmatch '/contentstorage' }
 
 	return $filtered | ForEach-Object { [PSCustomObject]@{ Url = $_ } }
+}
+
+function Is-TransientSharePointError {
+    param(
+        [Parameter(Mandatory = $true)] [object] $ErrorObject
+    )
+    try {
+        $ex = $null
+        $msg = $null
+        if ($ErrorObject -and $ErrorObject.PSObject.Properties['Exception']) { $ex = $ErrorObject.Exception }
+        if ($ErrorObject) { $msg = [string]$ErrorObject }
+        if ([string]::IsNullOrWhiteSpace($msg) -and $ex) { $msg = [string]$ex.Message }
+
+        if ($ex -and $ex.Response -and $ex.Response.StatusCode) {
+            $code = [int]$ex.Response.StatusCode.value__
+            if ($code -in 429,500,502,503,504) { return $true }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($msg)) {
+            if ($msg -match 'timed out|temporary|try again|forcibly closed|connection.*reset|could not be resolved|Something went wrong') { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Process-SiteForRetry {
+    param(
+        [Parameter(Mandatory = $true)] [string] $SiteUrl,
+        [Parameter(Mandatory = $true)] [string] $TenantName,
+        [Parameter(Mandatory = $true)] [string] $ClientId,
+        [Parameter(Mandatory = $true)] [string] $CertificatePath,
+        [Parameter(Mandatory = $false)] [securestring] $CertificatePassword,
+        [Parameter(Mandatory = $true)] [string] $UserEmail,
+        [Parameter(Mandatory = $true)] [object] $UserGroups,
+        [Parameter(Mandatory = $false)] [bool] $IsQuiet = $false,
+        [Parameter(Mandatory = $false)] [string] $LogPath
+    )
+
+    $results = @()
+    try {
+        if ($IsQuiet -and $LogPath) {
+            [System.IO.File]::AppendAllText($LogPath, "$(Get-Date) INFO: Retrying $SiteUrl..." + [Environment]::NewLine)
+        } else {
+            Write-Host "$(Get-Date) INFO: Retrying $SiteUrl..."
+        }
+
+        if ($CertificatePassword) {
+            $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+            try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
+        } else {
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+        }
+        $spoToken = Get-MsalToken -TenantId "$TenantName.onmicrosoft.com" -ClientId $ClientId -ClientCertificate $certificate -Scopes "https://$TenantName.sharepoint.com/.default"
+        $headers = @{ Authorization = "Bearer $($spoToken.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+
+        # Site admins
+        try {
+            $adminsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/siteusers?`$filter=IsSiteAdmin%20eq%20true") -BaseHeaders $headers -Method GET
+            $admins = @()
+            if ($adminsResponse) { if ($adminsResponse.value) { $admins = $adminsResponse.value } else { $admins = @($adminsResponse) } }
+            foreach ($admin in $admins) {
+                $adminLogin = $admin.LoginName
+                if ($adminLogin -match '\|') { $adminLogin = $adminLogin.Split('|')[-1] }
+                if ($UserEmail -eq $adminLogin -or ($null -ne $admin.Email -and $UserEmail -eq $admin.Email) -or ($null -ne $UserGroups -and $UserGroups.GroupId -contains $adminLogin)) {
+                    $results += [PSCustomObject]@{
+                        UserPrincipalName = $UserEmail
+                        SiteUrl           = $SiteUrl
+                        SiteAdmin         = $true
+                        GroupName         = $null
+                        PermissionLevel   = $null
+                        ListName          = $null
+                        ListPermission    = $null
+                        TotalRuntimeSeconds = $null
+                    }
+                    break
+                }
+            }
+        } catch { }
+
+        # Groups
+        try {
+            $groupsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/sitegroups") -BaseHeaders $headers -Method GET
+            $siteGroups = @()
+            if ($groupsResponse) { if ($groupsResponse.value) { $siteGroups = $groupsResponse.value } else { $siteGroups = @($groupsResponse) } }
+
+            $webAssignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headers -Method GET
+            $webRoleAssignments = @()
+            if ($webAssignmentsResponse) { if ($webAssignmentsResponse.value) { $webRoleAssignments = $webAssignmentsResponse.value } else { $webRoleAssignments = @($webAssignmentsResponse) } }
+
+            foreach ($group in $siteGroups) {
+                if ($null -eq $group) { continue }
+                $groupTitle = [string]$group.Title
+                if ($groupTitle -match "Limited Access|_catalog") { continue }
+
+                if ($groupTitle -like 'SharingLinks.*') {
+                    $matchingAssignments = @()
+                    if ($webRoleAssignments) { $matchingAssignments = $webRoleAssignments | Where-Object { $_.Member -and ($_.Member.Title -eq $groupTitle) } }
+                    $permSet = New-Object System.Collections.Generic.HashSet[string]
+                    foreach ($ra in $matchingAssignments) { if ($ra.RoleDefinitionBindings) { foreach ($binding in $ra.RoleDefinitionBindings) { if ($binding.Name) { [void]$permSet.Add([string]$binding.Name) } } } }
+                    $permString = (($permSet.ToArray()) -join ' | ')
+                    if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+                    $results += [PSCustomObject]@{
+                        UserPrincipalName = $UserEmail
+                        SiteUrl           = $SiteUrl
+                        SiteAdmin         = $false
+                        GroupName         = $groupTitle
+                        PermissionLevel   = $permString
+                        ListName          = $null
+                        ListPermission    = $null
+                        TotalRuntimeSeconds = $null
+                    }
+                    continue
+                }
+
+                if (-not $group.Id -or [string]::IsNullOrWhiteSpace("$($group.Id)")) { continue }
+                $membersResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/sitegroups/getbyid($($group.Id))/users") -BaseHeaders $headers -Method GET
+                $groupMembers = @()
+                if ($membersResponse) { if ($membersResponse.value) { $groupMembers = $membersResponse.value } else { $groupMembers = @($membersResponse) } }
+                $userIsInGroup = $false
+                foreach ($member in $groupMembers) {
+                    if ($null -eq $member -or [string]::IsNullOrWhiteSpace([string]$member.LoginName)) { continue }
+                    if ($member.LoginName -match '\\|') { $memberLogin = $member.LoginName.Split('|')[-1] } else { $memberLogin = $member.LoginName }
+                    if ($UserEmail -eq $memberLogin -or ($null -ne $UserGroups -and $UserGroups.GroupId -contains $memberLogin)) { $userIsInGroup = $true; break }
+                }
+                if ($userIsInGroup) {
+                    $bindingsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/roleassignments/getbyprincipalid($($group.Id))/roledefinitionbindings") -BaseHeaders $headers -Method GET
+                    $permissions = @()
+                    if ($bindingsResponse) { if ($bindingsResponse.value) { $permissions = $bindingsResponse.value } else { $permissions = @($bindingsResponse) } }
+                    $permNames = @(); foreach ($p in $permissions) { $permNames += $p.Name }
+                    $permString = ($permNames -join ' | ')
+                    if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+                    $results += [PSCustomObject]@{
+                        UserPrincipalName = $UserEmail
+                        SiteUrl           = $SiteUrl
+                        SiteAdmin         = $false
+                        GroupName         = $groupTitle
+                        PermissionLevel   = $permString
+                        ListName          = $null
+                        ListPermission    = $null
+                        TotalRuntimeSeconds = $null
+                    }
+                }
+            }
+        } catch { }
+
+        # Lists with unique permissions
+        try {
+            $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/lists?`$select=Id,Title,HasUniqueRoleAssignments&`$top=5000") -BaseHeaders $headers -Method GET
+            $lists = @()
+            if ($listsResponse) { if ($listsResponse.value) { $lists = $listsResponse.value } else { $lists = @($listsResponse) } }
+            foreach ($list in $lists) {
+                if (-not $list.HasUniqueRoleAssignments) { continue }
+                $assignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/lists(guid'$($list.Id)')/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headers -Method GET
+                $assignments = @()
+                if ($assignmentsResponse) { if ($assignmentsResponse.value) { $assignments = $assignmentsResponse.value } else { $assignments = @($assignmentsResponse) } }
+                foreach ($ra in $assignments) {
+                    $memberLogin = $ra.Member.LoginName
+                    if ($memberLogin -match '\\|') { $memberLogin = $memberLogin.Split('|')[-1] }
+                    if ($UserEmail -eq $memberLogin -or ($null -ne $UserGroups -and $UserGroups.GroupId -contains $memberLogin)) {
+                        $permNames = @(); foreach ($b in $ra.RoleDefinitionBindings) { $permNames += $b.Name }
+                        $permString = ($permNames -join ' | ')
+                        $results += [PSCustomObject]@{
+                            UserPrincipalName = $UserEmail
+                            SiteUrl           = $SiteUrl
+                            SiteAdmin         = $false
+                            GroupName         = $null
+                            PermissionLevel   = $null
+                            ListName          = $list.Title
+                            ListPermission    = $permString
+                            TotalRuntimeSeconds = $null
+                        }
+                    }
+                    if ($ra.Member -and $ra.Member.Title -like 'SharingLinks.*') {
+                        $permNames = @(); foreach ($b in $ra.RoleDefinitionBindings) { $permNames += $b.Name }
+                        $permString = ($permNames -join ' | ')
+                        if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+                        $results += [PSCustomObject]@{
+                            UserPrincipalName = $UserEmail
+                            SiteUrl           = $SiteUrl
+                            SiteAdmin         = $false
+                            GroupName         = $ra.Member.Title
+                            PermissionLevel   = $permString
+                            ListName          = $list.Title
+                            ListPermission    = $permString
+                            TotalRuntimeSeconds = $null
+                        }
+                    }
+                }
+            }
+        } catch { }
+    } catch { }
+
+    return $results
 }
 
 try {
@@ -419,12 +648,35 @@ $syncHash = [hashtable]::Synchronized(@{
     ProcessedCount = 0
     TotalCount = $totalSites
     LogLines = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    RetrySites = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 })
 
 # Process sites in parallel for improved performance
 $parallelResults = $siteCollections | ForEach-Object -Parallel {
     # Import required modules in each parallel runspace
     Import-Module MSAL.PS -ErrorAction SilentlyContinue
+    
+    function Is-TransientSharePointError {
+    	param(
+    		[Parameter(Mandatory = $true)] [object] $ErrorObject
+    	)
+    	try {
+    		$ex = $null
+    		$msg = $null
+    		if ($ErrorObject -and $ErrorObject.PSObject.Properties['Exception']) { $ex = $ErrorObject.Exception }
+    		if ($ErrorObject) { $msg = [string]$ErrorObject }
+    		if ([string]::IsNullOrWhiteSpace($msg) -and $ex) { $msg = [string]$ex.Message }
+
+    		if ($ex -and $ex.Response -and $ex.Response.StatusCode) {
+    			$code = [int]$ex.Response.StatusCode.value__
+    			if ($code -in 429,500,502,503,504) { return $true }
+    		}
+    		if (-not [string]::IsNullOrWhiteSpace($msg)) {
+    			if ($msg -match 'timed out|temporary|try again|forcibly closed|connection.*reset|could not be resolved|Something went wrong') { return $true }
+    		}
+    	} catch { }
+    	return $false
+    }
     
     function Invoke-SharePointRestWithAcceptFallback {
     	param (
@@ -437,44 +689,71 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
     		[Parameter(Mandatory = $false)]
     		[object] $Body
     	)
-    
-    	$acceptCandidates = @(
-    		'application/json;odata=nometadata',
-    		'application/json;odata=minimalmetadata',
-    		'application/json;odata=verbose',
-    		'application/json',
-    		''
-    	)
-    
-    	foreach ($accept in $acceptCandidates) {
-    		$headers = @{}
-    		foreach ($key in $BaseHeaders.Keys) {
-    			if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] }
-    		}
-    		if ([string]::IsNullOrEmpty($accept)) {
-    			if ($headers.ContainsKey('Accept')) { $headers.Remove('Accept') }
-    		} else {
-    			$headers['Accept'] = $accept
-    		}
-    
-    		try {
-    			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-    				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-    			} else {
-    				return Invoke-RestMethod -Uri $Uri -Headers $headers -Method $Method -ErrorAction Stop
+
+    	# Pinned handling with Search exception
+    	$headers = @{}
+    	foreach ($key in $BaseHeaders.Keys) { if ($key -ne 'Accept') { $headers[$key] = $BaseHeaders[$key] } }
+
+    	$uriWithFormat = $Uri
+    	$isSearch = $Uri -match '/_api/search/'
+    	if ($isSearch) {
+    		$accepts = @('application/json', 'application/json;odata=minimalmetadata', 'application/json;odata=verbose', '*/*', '')
+    		$attempt = 0
+    		while ($attempt -le $using:Max406Retries) {
+    			$accept = $accepts[$attempt % $accepts.Count]
+    			$variantHeaders = @{}
+    			foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+    			if ([string]::IsNullOrEmpty($accept)) { if ($variantHeaders.ContainsKey('Accept')) { $variantHeaders.Remove('Accept') } } else { $variantHeaders['Accept'] = $accept }
+    			try {
+    				if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    					return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+    				} else {
+    					return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+    				}
+    			}
+    			catch {
+    				$resp = $_.Exception.Response
+    				$status = $null
+    				if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+    				$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+    				if (-not $shouldNext) { throw }
+    				$attempt++
+    				continue
     			}
     		}
-    		catch {
-    			$resp = $_.Exception.Response
-    			$status = $null
-    			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
-    			$shouldFallback = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
-    			if ($shouldFallback) { continue }
-    			throw
+    		throw "Received 406 Not Acceptable from $Uri after $using:Max406Retries retries."
+    	}
+
+    	$headers['Accept'] = 'application/json;odata=nometadata'
+    	if ($uriWithFormat -match '(\?|&)`?\$format=') {
+    		$uriWithFormat = $uriWithFormat -replace '(\?|&)\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
+    	} else {
+    		$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+    		$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+    	}
+
+    	try {
+    		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+    		} else {
+    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
     		}
     	}
-    
-    	throw "Received 406 Not Acceptable from $Uri for all Accept variants."
+    	catch {
+    		$resp = $_.Exception.Response
+    		$status = $null
+    		if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+    		$shouldRetryMinimal = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+    		if (-not $shouldRetryMinimal) { throw }
+
+    		$headers['Accept'] = 'application/json;odata=minimalmetadata'
+    		$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
+    		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
+    		} else {
+    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
+    		}
+    	}
     }
 
     $site = $_
@@ -554,11 +833,8 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
             }
         }
         catch {
-            if ($localIsQuiet -and $localLog) {
-                [void]$sync.LogLines.Add("WARNING: Error checking site admin status for $($site.Url): $_")
-            } else {
-                Write-Warning "Error checking site admin status for $($site.Url): $_"
-            }
+            if ($localIsQuiet -and $localLog) { [void]$sync.LogLines.Add("WARNING: Error checking site admin status for $($site.Url): $_") } else { Write-Warning "Error checking site admin status for $($site.Url): $_" }
+            if (Is-TransientSharePointError -ErrorObject $_) { [void]$sync.RetrySites.Add(@{ Url = $site.Url }) }
         }
         
         if (-not $isSiteAdmin) {
@@ -577,12 +853,53 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                 $groupsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/sitegroups") -BaseHeaders $headersGroups -Method GET
                 $siteGroups = @()
                 if ($groupsResponse) { if ($groupsResponse.value) { $siteGroups = $groupsResponse.value } else { $siteGroups = @($groupsResponse) } }
+
+                # Retrieve web-level role assignments to resolve SharingLinks principals
+                $webAssignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headersGroups -Method GET
+                $webRoleAssignments = @()
+                if ($webAssignmentsResponse) { if ($webAssignmentsResponse.value) { $webRoleAssignments = $webAssignmentsResponse.value } else { $webRoleAssignments = @($webAssignmentsResponse) } }
                 foreach ($group in $siteGroups) {
                     try {
+                        if ($null -eq $group) { continue }
+                        $groupTitle = [string]$group.Title
                         # Skip system groups that might cause issues
-                        if ($group.Title -match "Limited Access|SharingLinks\.|_catalog") {
+                        if ($groupTitle -match "Limited Access|_catalog") {
         continue
     }
+
+                        # Special handling for SharingLinks principals at web scope
+                        if ($groupTitle -like 'SharingLinks.*') {
+                            try {
+                                $matchingAssignments = @()
+                                if ($webRoleAssignments) { $matchingAssignments = $webRoleAssignments | Where-Object { $_.Member -and ($_.Member.Title -eq $groupTitle) } }
+                                $permSet = New-Object System.Collections.Generic.HashSet[string]
+                                foreach ($ra in $matchingAssignments) {
+                                    if ($ra.RoleDefinitionBindings) { foreach ($binding in $ra.RoleDefinitionBindings) { if ($binding.Name) { [void]$permSet.Add([string]$binding.Name) } } }
+                                }
+                                $permString = (($permSet.ToArray()) -join ' | ')
+                                if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+
+                                if ($localIsQuiet -and $localLog) {
+                                    [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail sharing link $groupTitle has $permString at site level.")
+                                } else {
+                                    Write-Host "$(Get-Date) INFO: `t$localUserEmail sharing link $groupTitle has $permString at site level."
+                                }
+                                $localResults += [PSCustomObject]@{
+                                    UserPrincipalName = $localUserEmail
+                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                    GroupName         = $groupTitle
+                                    PermissionLevel   = $permString
+                ListName          = $null
+                ListPermission    = $null
+                TotalRuntimeSeconds = $null
+            }
+                                continue
+                            } catch { continue }
+                        }
+
+                        # Ensure group has a valid Id before ID-based REST calls
+                        if (-not $group.Id -or [string]::IsNullOrWhiteSpace("$($group.Id)")) { continue }
 
                         # Retrieve members via SharePoint REST
                         $membersResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/sitegroups/getbyid($($group.Id))/users") -BaseHeaders $headersGroups -Method GET
@@ -591,7 +908,8 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                         $userIsInGroup = $false
                         
                         foreach ($member in $groupMembers) {
-                            if ($member.LoginName -match '\|') {
+                            if ($null -eq $member -or [string]::IsNullOrWhiteSpace([string]$member.LoginName)) { continue }
+                            if ($member.LoginName -match '\\|') {
                                 $memberLogin = $member.LoginName.Split('|')[-1]
                             } else {
                                 $memberLogin = $member.LoginName
@@ -620,15 +938,15 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                             }
                             
                             if ($localIsQuiet -and $localLog) {
-                                [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail is a member of $($group.Title) with $permString permissions.")
+                                [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail is a member of $groupTitle with $permString permissions.")
                             } else {
-                                Write-Host "$(Get-Date) INFO: `t$localUserEmail is a member of $($group.Title) with $permString permissions."
+                                Write-Host "$(Get-Date) INFO: `t$localUserEmail is a member of $groupTitle with $permString permissions."
                             }
                             $localResults += [PSCustomObject]@{
                                 UserPrincipalName = $localUserEmail
                                 SiteUrl           = $site.Url
                 SiteAdmin         = $false
-                                GroupName         = $group.Title
+                                GroupName         = $groupTitle
                                 PermissionLevel   = $permString
                 ListName          = $null
                 ListPermission    = $null
@@ -638,19 +956,16 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                     }
                     catch {
                         if ($localIsQuiet -and $localLog) {
-                            [void]$sync.LogLines.Add("WARNING: Error processing group $($group.Title): $_")
+                            [void]$sync.LogLines.Add("WARNING: Error processing group $($groupTitle): $_")
                         } else {
-                            Write-Warning "Error processing group $($group.Title): $_"
+                            Write-Warning "Error processing group $($groupTitle): $_"
                         }
                     }
                 }
             }
             catch {
-                if ($localIsQuiet -and $localLog) {
-                    [void]$sync.LogLines.Add("WARNING: Error getting site groups for $($site.Url): $_")
-                } else {
-                    Write-Warning "Error getting site groups for $($site.Url): $_"
-                }
+                if ($localIsQuiet -and $localLog) { [void]$sync.LogLines.Add("WARNING: Error getting site groups for $($site.Url): $_") } else { Write-Warning "Error getting site groups for $($site.Url): $_" }
+                if (Is-TransientSharePointError -ErrorObject $_) { [void]$sync.RetrySites.Add(@{ Url = $site.Url }) }
             }
             
             # Check list permissions
@@ -719,6 +1034,30 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                 TotalRuntimeSeconds = $null
             }
                             }
+
+                            # Include SharingLinks principals at list scope
+                            if ($roleAssignment.Member -and $roleAssignment.Member.Title -like 'SharingLinks.*') {
+                                $permissionNames = @()
+                                foreach ($binding in $roleAssignment.RoleDefinitionBindings) { $permissionNames += $binding.Name }
+                                $permissionString = $permissionNames -join " | "
+                                if ([string]::IsNullOrWhiteSpace($permissionString)) { $permissionString = 'No Permissions' }
+
+                                if ($localIsQuiet -and $localLog) {
+                                    [void]$sync.LogLines.Add("$(Get-Date) INFO: `tSharing link $($roleAssignment.Member.Title) has $permissionString on list $($list.Title).")
+                                } else {
+                                    Write-Host "$(Get-Date) INFO: `tSharing link $($roleAssignment.Member.Title) has $permissionString on list $($list.Title)."
+                                }
+                                $localResults += [PSCustomObject]@{
+                                    UserPrincipalName = $localUserEmail
+                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                    GroupName         = $roleAssignment.Member.Title
+                                    PermissionLevel   = $permissionString
+                ListName          = $list.Title
+                ListPermission    = $permissionString
+                TotalRuntimeSeconds = $null
+            }
+                            }
                         }
                     }
                     catch {
@@ -728,28 +1067,44 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                 }
             }
             catch {
-                if ($localIsQuiet -and $localLog) {
-                    [void]$sync.LogLines.Add("WARNING: Error checking list permissions for $($site.Url): $_")
-                } else {
-                    Write-Warning "Error checking list permissions for $($site.Url): $_"
-                }
+                if ($localIsQuiet -and $localLog) { [void]$sync.LogLines.Add("WARNING: Error checking list permissions for $($site.Url): $_") } else { Write-Warning "Error checking list permissions for $($site.Url): $_" }
+                if (Is-TransientSharePointError -ErrorObject $_) { [void]$sync.RetrySites.Add(@{ Url = $site.Url }) }
             }
         }
         
         # No PnP disconnect needed
     }
     catch {
-        if ($localIsQuiet -and $localLog) {
-            [void]$sync.LogLines.Add("WARNING: Error processing site $($site.Url): $($_.Exception.Message)")
-        } else {
-            Write-Warning "Error processing site $($site.Url): $($_.Exception.Message)"
-        }
+        if ($localIsQuiet -and $localLog) { [void]$sync.LogLines.Add("WARNING: Error processing site $($site.Url): $($_.Exception.Message)") } else { Write-Warning "Error processing site $($site.Url): $($_.Exception.Message)" }
+        if (Is-TransientSharePointError -ErrorObject $_) { [void]$sync.RetrySites.Add(@{ Url = $site.Url }) }
     }
     
     # Return results from this parallel iteration
     $localResults
     
 } -ThrottleLimit $ThrottleLimit
+
+# Final sweep for transient failures (single pass, no artificial waits)
+$retrySitesUnique = @()
+if ($syncHash.RetrySites.Count -gt 0) {
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($it in $syncHash.RetrySites) {
+        $u = [string]$it.Url
+        if (-not [string]::IsNullOrWhiteSpace($u)) { if ($seen.Add($u)) { $retrySitesUnique += $u } }
+    }
+    if ($retrySitesUnique.Count -gt 0) {
+        Write-Major "$(Get-Date) INFO: Retrying $($retrySitesUnique.Count) sites after main pass..."
+        $retryResults = @()
+        foreach ($retryUrl in $retrySitesUnique) {
+            try {
+                $retryResults += Process-SiteForRetry -SiteUrl $retryUrl -TenantName $TenantName -ClientId $ClientId -CertificatePath $CertificatePath -CertificatePassword $CertificatePassword -UserEmail $UserEmail -UserGroups $userGroupMembership -IsQuiet $ConsoleQuiet -LogPath $Log
+            } catch { }
+        }
+        if ($retryResults -and $retryResults.Count -gt 0) {
+            $parallelResults = @($parallelResults + $retryResults)
+        }
+    }
+}
 
 # Flush buffered detailed log lines to the log file (single write) if quiet mode is enabled
 if ($ConsoleQuiet -and $Log -and ($syncHash.LogLines.Count -gt 0 -or $LogBuffer.Count -gt 0)) {
@@ -767,11 +1122,16 @@ if ($ConsoleQuiet -and $Log -and ($syncHash.LogLines.Count -gt 0 -or $LogBuffer.
     } catch { }
 }
 
-# Write all results to CSV
+# Deduplicate and write all results to CSV
 Write-Major "$(Get-Date) INFO: Writing results to CSV..."
+$dedup = @{}
 foreach ($result in $parallelResults) {
     if ($result) {
-        $result | Export-Csv -Path $CSVPath -Append -NoTypeInformation
+        $key = ("$($result.UserPrincipalName)|$($result.SiteUrl)|$($result.SiteAdmin)|$($result.GroupName)|$($result.PermissionLevel)|$($result.ListName)|$($result.ListPermission)")
+        if (-not $dedup.ContainsKey($key)) {
+            $dedup[$key] = $true
+            $result | Export-Csv -Path $CSVPath -Append -NoTypeInformation
+        }
     }
 }
 
@@ -810,3 +1170,4 @@ catch {
     Write-Warn "Skipping user '$UserEmail' due to error: $($_.Exception.Message)"
     return
 }
+
