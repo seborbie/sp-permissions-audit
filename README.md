@@ -63,7 +63,7 @@ Follow the steps in [this article](https://docs.microsoft.com/en-us/sharepoint/d
 ## Usage
 
 The intention is for this script to be called by a parent script that will pass in the required parameters. This allows you to run the script against multiple users and potentially multiple tenants.
-Below is an example of how you might call the script.
+Below is an example of how you might call the script. This example assumes you've exported a list of users from Entra ID into a CSV file that would then get imported for the purpose of this script.
 
 ```powershell
 # audit.ps1 - Create in the same directory as Get-SharePointTenantPermissions.ps1
@@ -73,14 +73,11 @@ $csvPath = "C:\temp\permissions.csv" # The path to the output CSV file
 $clientID = "00000000-0000-0000-0000-000000000000" # The client ID of the app registration
 $certificatePath = "C:\temp\certificate.pfx" # The path to the certificate file
 $append = $true # Should the script append to the CSV file or overwrite it?
-$logPath = "C:\\logs\\sp-permissions\\audit.log" # Optional: transcript log path
+$logPath = "C:\logs\sp-permissions\audit.log" # Optional: transcript log path
 $certPassword = Read-Host -AsSecureString -Prompt "Enter PFX password" # Optional: only if your PFX is password-protected
 $throttleLimit = 1 # Number of parallel threads (set higher to process sites in parallel)
 
-$users = @(
-    "john@contoso.com",
-    "jane@contoso.com"
-)
+$users = Import-Csv -Path "C:\temp\users.csv"
 
 foreach ($user in $users) {
     .\Get-SharePointTenantPermissions.ps1 `
@@ -90,62 +87,12 @@ foreach ($user in $users) {
         -CertificatePath $certificatePath `
         -CertificatePassword $certPassword ` # Optional: include if your PFX has a password
         -Append:$append `
-        -UserEmail $user `
+        -UserEmail $user.UserPrincipalName `
         -ThrottleLimit $throttleLimit `    # Optional: adjust parallel processing (default: 10)
         -Log $logPath `                    # Optional: write output to a transcript log
         -AppendLog                         # Optional: append to existing log instead of overwriting
 }
 ```
-
-## Enumerate all tenant users (Directory.Read.All)
-
-Use `Get-TenantUsers.ps1` to list every user in the tenant using Microsoft Graph with certificate-based authentication.
-
-### Prerequisites
--   **Module**: `MSAL.PS`
--   **App permission**: Graph `Directory.Read.All` (Application)
-
-### Examples
-
-```powershell
-# Console output
-.\Get-TenantUsers.ps1 `
-  -TenantName "contoso" `
-  -ClientId "00000000-0000-0000-0000-000000000000" `
-  -CertificatePath "C:\temp\certificate.pfx"
-
-# Export to CSV (overwrite existing file)
-.\Get-TenantUsers.ps1 `
-  -TenantName "contoso" `
-  -ClientId "00000000-0000-0000-0000-000000000000" `
-  -CertificatePath "C:\temp\certificate.pfx" `
-  -CSVPath "C:\temp\tenant-users.csv"
-
-# With password-protected PFX and transcript logging
-$certPassword = Read-Host -AsSecureString -Prompt "Enter PFX password"
-.\Get-TenantUsers.ps1 `
-  -TenantName "contoso" `
-  -ClientId "00000000-0000-0000-0000-000000000000" `
-  -CertificatePath "C:\temp\certificate.pfx" `
-  -CertificatePassword $certPassword `
-  -CSVPath "C:\temp\tenant-users.csv" `
-  -Log "C:\logs\tenant-users.log" -AppendLog
-```
-
-### Output columns
-
-| Column | Description |
-| --- | --- |
-| Id | Graph object id |
-| DisplayName | User display name |
-| UserPrincipalName | UPN/email |
-| Mail | Primary SMTP address (may be null) |
-| AccountEnabled | Whether the account is enabled |
-| UserType | Member/Guest |
-| Department | Department (if set) |
-| JobTitle | Job title (if set) |
-| CreatedDateTime | Creation timestamp |
-| OnPremisesSyncEnabled | True if synced from on-premises |
 
 ### Parallel processing
 
