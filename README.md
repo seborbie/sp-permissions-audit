@@ -38,13 +38,12 @@ In addition to the detailed rows, the script appends a final summary row per use
 
 ### Prerequisites
 
--   Global Adminstrator Role
--   PowerShell 7 or later with the latest version of [MSAL.PS](https://github.com/AzureAD/MSAL.PS/) installed.
+-   Global Administrator role
+-   PowerShell 7.5.2 or later
+-   No manual `MSAL.PS` installation is required. The script will automatically install and import `MSAL.PS` for the current user on first run (from `PSGallery`), registering and trusting `PSGallery` if needed.
 -   A self-signed certificate for use with the app registration. See [this article](https://docs.microsoft.com/en-us/sharepoint/dev/solution-guidance/security-apponly-azuread) for more information.
 
-```powershell
-Install-Module -Name MSAL.PS -Scope CurrentUser
-```
+If your environment blocks online installs, pre-install `MSAL.PS` via your approved repository or offline package and ensure it is available to the current user.
 
 ### Create an Entra ID App Registration
 
@@ -79,20 +78,13 @@ $throttleLimit = 1 # Number of parallel threads (set higher to process sites in 
 
 $users = Import-Csv -Path "C:\temp\users.csv"
 
-foreach ($user in $users) {
-    .\Get-SharePointTenantPermissions.ps1 `
-        -TenantName $tenantName `
-        -CsvPath $csvPath `
-        -ClientID $clientID `
-        -CertificatePath $certificatePath `
-        -CertificatePassword $certPassword ` # Optional: include if your PFX has a password
-        -Append:$append `
-        -UserEmail $user.UserPrincipalName `
-        -ThrottleLimit $throttleLimit `    # Optional: adjust parallel processing (default: 10)
-        -Log $logPath `                    # Optional: write output to a transcript log
-        -AppendLog                         # Optional: append to existing log instead of overwriting
-}
+foreach ($user in $users) { .\Get-SharePointTenantPermissions.ps1 -TenantName $tenantName -CsvPath $csvPath -ClientID $clientID -CertificatePath $certificatePath -CertificatePassword $certPassword -Append:$append -UserEmail $user.UserPrincipalName -ThrottleLimit $throttleLimit -Log $logPath -AppendLog }
 ```
+
+Notes:
+
+-   The script enforces PowerShell 7.5.2+ via a `#requires` directive and will fail fast on older versions.
+-   On first run, if `MSAL.PS` is missing for the current user, the script installs it from `PSGallery` and imports it automatically.
 
 ### Parallel processing
 

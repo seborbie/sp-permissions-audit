@@ -1,7 +1,7 @@
 # Get-SharePointTenantPermissions.ps1
 # Description: This script will get all the permissions for a given user or users in a SharePoint Online tenant and export them to a CSV file.
 
-#requires -Modules MSAL.PS
+#requires -Version 7.5.2
 param (
     [Parameter(Mandatory = $true)]
     [string] $TenantName,
@@ -26,6 +26,26 @@ param (
     [Parameter(Mandatory = $false)]
     [int] $Max406Retries = 999
 )
+
+# Ensure MSAL.PS is available for the current user (non-interactive install on first run)
+try {
+    # Prefer TLS 1.2 for gallery operations when needed
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+    if (-not (Get-Module -ListAvailable -Name 'MSAL.PS')) {
+        try { $null = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction Stop } catch { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null }
+        $psg = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+        if (-not $psg) { Register-PSRepository -Default -ErrorAction Stop }
+        $psg = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+        if ($psg -and $psg.InstallationPolicy -ne 'Trusted') { Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted }
+        Install-Module -Name 'MSAL.PS' -Scope CurrentUser -Force -ErrorAction Stop
+    }
+    Import-Module 'MSAL.PS' -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to ensure MSAL.PS module is installed/imported: $($_.Exception.Message)"
+    throw
+}
 
 # Start benchmarking for this user
 $scriptStartTime = Get-Date
@@ -651,10 +671,25 @@ $syncHash = [hashtable]::Synchronized(@{
     RetrySites = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 })
 
+# Acquire one SharePoint access token up-front and share with parallel runspaces
+try {
+    if ($CertificatePassword) {
+        $passwordBstr_init = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+        try { $plainPassword_init = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr_init) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr_init) }
+        $certificate_init = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword_init)
+    } else {
+        $certificate_init = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+    }
+    $spoToken_init = Get-MsalToken -TenantId "$TenantName.onmicrosoft.com" -ClientId $ClientId -ClientCertificate $certificate_init -Scopes "https://$TenantName.sharepoint.com/.default"
+    $SpoAccessToken = $spoToken_init.AccessToken
+} catch {
+    Write-Error "Failed to acquire initial SharePoint token: $($_.Exception.Message)"
+    throw
+}
+
 # Process sites in parallel for improved performance
 $parallelResults = $siteCollections | ForEach-Object -Parallel {
-    # Import required modules in each parallel runspace
-    Import-Module MSAL.PS -ErrorAction SilentlyContinue
+    # Use the pre-acquired SPO access token from parent runspace
     
     function Is-TransientSharePointError {
     	param(
@@ -759,18 +794,12 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
     $site = $_
     $localResults = @()
     
-    # Import variables from parent scope
-    $localTenantName = $using:TenantName
-    $localClientId = $using:ClientId
-    $localCertPath = $using:CertificatePath
-    $localCertPassword = $using:CertificatePassword
+    # Import variables from parent scope (only those actually needed)
     $localUserEmail = $using:UserEmail
     $localUserGroups = $using:userGroupMembership
     $sync = $using:syncHash
-    $localThrottleLimit = $using:ThrottleLimit
     $localIsQuiet = $using:ConsoleQuiet
     $localLog = $using:Log
-    $localLogBuffer = $using:LogBuffer
     
     # Increment and get the current count
     $sync.ProcessedCount++
@@ -787,18 +816,8 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
         # Check if user is site collection admin via SharePoint REST
         $isSiteAdmin = $false
         try {
-            # Build certificate in this runspace
-            if ($localCertPassword) {
-                $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
-                try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
-                $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPassword)
-            } else {
-                $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
-            }
-
-            # Acquire SharePoint token (app-only)
-            $spoToken = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificate -Scopes "https://$localTenantName.sharepoint.com/.default"
-            $headers = @{ Authorization = "Bearer $($spoToken.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+            # Use shared SharePoint access token (app-only)
+            $headers = @{ Authorization = "Bearer $using:SpoAccessToken"; Accept = 'application/json;odata=nometadata' }
 
             # Retrieve site admins
             $adminsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/siteusers?`$filter=IsSiteAdmin%20eq%20true") -BaseHeaders $headers -Method GET
@@ -841,15 +860,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
             # Check SharePoint groups
             try {
                 # Retrieve site groups via SharePoint REST
-                if ($localCertPassword) {
-                    $passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
-                    try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
-                    $certificateGroups = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPassword)
-                } else {
-                    $certificateGroups = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
-                }
-                $spoTokenGroups = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificateGroups -Scopes "https://$localTenantName.sharepoint.com/.default"
-                $headersGroups = @{ Authorization = "Bearer $($spoTokenGroups.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+                $headersGroups = @{ Authorization = "Bearer $using:SpoAccessToken"; Accept = 'application/json;odata=nometadata' }
                 $groupsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/sitegroups") -BaseHeaders $headersGroups -Method GET
                 $siteGroups = @()
                 if ($groupsResponse) { if ($groupsResponse.value) { $siteGroups = $groupsResponse.value } else { $siteGroups = @($groupsResponse) } }
@@ -970,16 +981,8 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
             
             # Check list permissions
             try {
-                # Build certificate and headers for REST calls
-                if ($localCertPassword) {
-                    $passwordBstrLists = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($localCertPassword)
-                    try { $plainPasswordLists = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstrLists) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstrLists) }
-                    $certificateLists = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath, $plainPasswordLists)
-                } else {
-                    $certificateLists = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($localCertPath)
-                }
-                $spoTokenLists = Get-MsalToken -TenantId "$localTenantName.onmicrosoft.com" -ClientId $localClientId -ClientCertificate $certificateLists -Scopes "https://$localTenantName.sharepoint.com/.default"
-                $headersLists = @{ Authorization = "Bearer $($spoTokenLists.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+                # Headers for REST calls
+                $headersLists = @{ Authorization = "Bearer $using:SpoAccessToken"; Accept = 'application/json;odata=nometadata' }
 
                 $excludedLists = @("App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", 
                     "Composed Looks", "Content and Structure Reports", "Content type publishing error log", 
