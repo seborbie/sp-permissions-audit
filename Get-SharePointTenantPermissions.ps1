@@ -285,37 +285,65 @@ function Invoke-SharePointRestWithAcceptFallback {
 	}
 
 	# Non-Search: use OData nometadata and ensure $format matches
-	$headers['Accept'] = 'application/json;odata=nometadata'
-	if ($uriWithFormat -match '(\?|&)`?\$format=') {
-		$uriWithFormat = $uriWithFormat -replace '(\?|&)\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
-	} else {
-		$separator = ($uriWithFormat -match '\?') ? '&' : '?'
-		$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+	$uriBase = $Uri
+	$attempt = 0
+	while ($attempt -le $Max406Retries) {
+		# Variant 1: nometadata
+		$variantHeaders = @{}
+		foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+		$variantHeaders['Accept'] = 'application/json;odata=nometadata'
+		$uriWithFormat = $uriBase
+		if ($uriWithFormat -match '(\?|&)`?\$format=') {
+			$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
+		} else {
+			$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+			$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+		}
+		try {
+			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+			} else {
+				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+			}
+		}
+		catch {
+			$resp = $_.Exception.Response
+			$status = $null
+			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+			$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+			if (-not $shouldNext) { throw }
+		}
+
+		# Variant 2: minimalmetadata
+		$variantHeaders = @{}
+		foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+		$variantHeaders['Accept'] = 'application/json;odata=minimalmetadata'
+		$uriWithFormat = $uriBase
+		if ($uriWithFormat -match '(\?|&)`?\$format=') {
+			$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
+		} else {
+			$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+			$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=minimalmetadata"
+		}
+		try {
+			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+			} else {
+				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+			}
+		}
+		catch {
+			$resp = $_.Exception.Response
+			$status = $null
+			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+			$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+			if (-not $shouldNext) { throw }
+		}
+
+		$attempt++
 	}
 
-	try {
-		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-		} else {
-			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
-		}
-	}
-	catch {
-		$resp = $_.Exception.Response
-		$status = $null
-		if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
-		$shouldRetryMinimal = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
-		if (-not $shouldRetryMinimal) { throw }
-
-		# Retry once with minimalmetadata only
-		$headers['Accept'] = 'application/json;odata=minimalmetadata'
-		$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
-		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-		} else {
-			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
-		}
-	}
+	throw "Received 406 Not Acceptable from $Uri after $Max406Retries retries."
 }
 
 function Get-UserOneDriveSiteUrl {
@@ -375,21 +403,31 @@ function Get-TenantSitesRest {
 	$rowLimit = 500
 	$allUrls = New-Object System.Collections.Generic.List[string]
 
-	do {
-		$uri = "https://$adminHost/_api/search/query?querytext='contentclass:STS_Site'&rowlimit=$rowLimit&startrow=$startRow&trimduplicates=false&selectproperties='Path'"
-		$response = Invoke-SharePointRestWithAcceptFallback -Uri $uri -BaseHeaders $headers -Method GET
-		$results = $response.PrimaryQueryResult.RelevantResults
-		if ($results -and $results.Table -and $results.Table.Rows) {
-			foreach ($row in $results.Table.Rows) {
-				$props = @{}
-				foreach ($cell in $row.Cells) { $props[$cell.Key] = $cell.Value }
-				if ($props.ContainsKey('Path') -and $props['Path']) {
-					[void]$allUrls.Add($props['Path'])
+	# Retry entire search until we get non-zero collections or attempts exhausted
+	$outerAttempts = 0
+	$foundAny = $false
+	while (-not $foundAny -and $outerAttempts -le $Max406Retries) {
+		$outerAttempts++
+		$startRow = 0
+		$allUrls.Clear()
+		do {
+			$uri = "https://$adminHost/_api/search/query?querytext='contentclass:STS_Site'&rowlimit=$rowLimit&startrow=$startRow&trimduplicates=false&selectproperties='Path'"
+			$response = Invoke-SharePointRestWithAcceptFallback -Uri $uri -BaseHeaders $headers -Method GET
+			$results = $response.PrimaryQueryResult.RelevantResults
+			if ($results -and $results.Table -and $results.Table.Rows) {
+				foreach ($row in $results.Table.Rows) {
+					$props = @{}
+					foreach ($cell in $row.Cells) { $props[$cell.Key] = $cell.Value }
+					if ($props.ContainsKey('Path') -and $props['Path']) {
+						[void]$allUrls.Add($props['Path'])
+					}
 				}
 			}
-		}
-		$startRow += $rowLimit
-	} while ($results -and $results.TotalRows -gt $startRow)
+			$startRow += $rowLimit
+		} while ($results -and $results.TotalRows -gt $startRow)
+
+		if ($allUrls.Count -gt 0) { $foundAny = $true }
+	}
 
 	# Filter out other users' personal sites; keep only the current user's OneDrive
 	$uniqueUrls = $allUrls | Select-Object -Unique
@@ -759,36 +797,65 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
     		throw "Received 406 Not Acceptable from $Uri after $using:Max406Retries retries."
     	}
 
-    	$headers['Accept'] = 'application/json;odata=nometadata'
-    	if ($uriWithFormat -match '(\?|&)`?\$format=') {
-    		$uriWithFormat = $uriWithFormat -replace '(\?|&)\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
-    	} else {
-    		$separator = ($uriWithFormat -match '\?') ? '&' : '?'
-    		$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+    	$uriBase = $Uri
+    	$attempt = 0
+    	while ($attempt -le $using:Max406Retries) {
+    		# Variant 1: nometadata
+    		$variantHeaders = @{}
+    		foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+    		$variantHeaders['Accept'] = 'application/json;odata=nometadata'
+    		$uriWithFormat = $uriBase
+    		if ($uriWithFormat -match '(\?|&)`?\$format=') {
+    			$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=nometadata'
+    		} else {
+    			$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+    			$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=nometadata"
+    		}
+    		try {
+    			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+    			} else {
+    				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+    			}
+    		}
+    		catch {
+    			$resp = $_.Exception.Response
+    			$status = $null
+    			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+    			$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+    			if (-not $shouldNext) { throw }
+    		}
+
+    		# Variant 2: minimalmetadata
+    		$variantHeaders = @{}
+    		foreach ($k in $headers.Keys) { if ($k -ne 'Accept') { $variantHeaders[$k] = $headers[$k] } }
+    		$variantHeaders['Accept'] = 'application/json;odata=minimalmetadata'
+    		$uriWithFormat = $uriBase
+    		if ($uriWithFormat -match '(\?|&)`?\$format=') {
+    			$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
+    		} else {
+    			$separator = ($uriWithFormat -match '\?') ? '&' : '?'
+    			$uriWithFormat = "$uriWithFormat${separator}`$format=application/json;odata=minimalmetadata"
+    		}
+    		try {
+    			if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+    				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -Body $Body -ErrorAction Stop
+    			} else {
+    				return Invoke-RestMethod -Uri $uriWithFormat -Headers $variantHeaders -Method $Method -ErrorAction Stop
+    			}
+    		}
+    		catch {
+    			$resp = $_.Exception.Response
+    			$status = $null
+    			if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
+    			$shouldNext = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
+    			if (-not $shouldNext) { throw }
+    		}
+
+    		$attempt++
     	}
 
-    	try {
-    		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-    		} else {
-    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
-    		}
-    	}
-    	catch {
-    		$resp = $_.Exception.Response
-    		$status = $null
-    		if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode.value__ }
-    		$shouldRetryMinimal = ($status -eq 406) -or ($_.Exception.Message -match '406|Not Acceptable')
-    		if (-not $shouldRetryMinimal) { throw }
-
-    		$headers['Accept'] = 'application/json;odata=minimalmetadata'
-    		$uriWithFormat = $uriWithFormat -replace '(\?|&)`?\$format=[^&]+', '$1`$format=application/json;odata=minimalmetadata'
-    		if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -Body $Body -ErrorAction Stop
-    		} else {
-    			return Invoke-RestMethod -Uri $uriWithFormat -Headers $headers -Method $Method -ErrorAction Stop
-    		}
-    	}
+    	throw "Received 406 Not Acceptable from $Uri after $using:Max406Retries retries."
     }
 
     $site = $_
