@@ -1,7 +1,7 @@
 # Get-SharePointTenantPermissions.ps1
 # Description: This script will get all the permissions for a given user or users in a SharePoint Online tenant and export them to a CSV file.
 
-#requires -Version 7.5.2
+#requires -Version 7.5.4
 param (
     [Parameter(Mandatory = $true)]
     [string] $TenantName,
@@ -24,7 +24,11 @@ param (
     [Parameter(Mandatory = $false)]
     [int] $ThrottleLimit = 1,  # Number of parallel threads (increase to enable concurrent site processing)
     [Parameter(Mandatory = $false)]
-    [int] $Max406Retries = 999
+    [int] $Max406Retries = 999,
+    [Parameter(Mandatory = $false)]
+    [switch] $ResolveItemSharingLinks,
+    [Parameter(Mandatory = $false)]
+    [int] $MaxItemScanPerList = 500
 )
 
 # Ensure MSAL.PS is available for the current user (non-interactive install on first run)
@@ -53,6 +57,10 @@ $scriptStartTime = Get-Date
 # Console verbosity control: when -Log is supplied, keep console output minimal
 $ConsoleQuiet = $false
 if ($PSBoundParameters.ContainsKey('Log') -and $Log) { $ConsoleQuiet = $true }
+
+# Defaults for new sharing link resolution (enabled unless explicitly disabled)
+if (-not $PSBoundParameters.ContainsKey('ResolveItemSharingLinks')) { $ResolveItemSharingLinks = $true }
+if (-not $PSBoundParameters.ContainsKey('MaxItemScanPerList') -or $MaxItemScanPerList -le 0) { $MaxItemScanPerList = 200 }
 
 # Buffer log lines when console is quiet to avoid file locking during execution
 $LogBuffer = $null
@@ -124,6 +132,180 @@ function Get-GraphToken {
         Write-Error $_.Exception.Message
         throw $_
     }
+}
+
+function Get-GraphUserObjectId {
+	param(
+		[Parameter(Mandatory = $true)] [string] $UserEmail
+	)
+	$token = Get-GraphToken
+	$encodedUserEmail = [System.Web.HttpUtility]::UrlEncode($UserEmail)
+	try {
+		$user = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/users/$encodedUserEmail?$select=id,userPrincipalName,mail" -Method GET -Headers @{ Authorization = "Bearer $($token.AccessToken)" } | ConvertFrom-Json
+		return ($user.id)
+	} catch { return $null }
+}
+
+function Get-GraphSiteId {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl
+	)
+	$token = Get-GraphToken
+	try {
+		$u = [Uri]$SiteUrl
+		$host = $u.Host
+		$path = $u.AbsolutePath
+		if ([string]::IsNullOrWhiteSpace($path)) { $path = '/' }
+		$resp = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/sites/$($host):$($path)?$select=id" -Method GET -Headers @{ Authorization = "Bearer $($token.AccessToken)" } -ErrorAction Stop | ConvertFrom-Json
+		return $resp.id
+	} catch { return $null }
+}
+
+function Get-GraphListItemPermissionsByIds {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $ListId,
+		[Parameter(Mandatory = $true)] [int] $ItemId,
+		[Parameter(Mandatory = $true)] [string] $GraphAccessToken
+	)
+
+	try {
+		$siteId = Get-GraphSiteId -SiteUrl $SiteUrl
+		if (-not $siteId) { return $null }
+		$item = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$ListId/items/$ItemId/driveItem?$select=id,webUrl" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		if (-not $item -or -not $item.id) { return $null }
+		$perms = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$ListId/items/$ItemId/driveItem/permissions" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		return @{ ItemWebUrl = $item.webUrl; Permissions = $perms.value }
+	} catch { return $null }
+}
+
+function Get-UserAccessibleSharingLinksForListItem {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $ListId,
+		[Parameter(Mandatory = $true)] [int] $ItemId,
+		[Parameter(Mandatory = $true)] [string] $UserEmail,
+		[Parameter(Mandatory = $true)] [object] $UserGroups
+	)
+
+	$graphToken = Get-GraphToken
+	$userId = Get-GraphUserObjectId -UserEmail $UserEmail
+	if (-not $graphToken -or -not $graphToken.AccessToken) { return @() }
+	$resp = Get-GraphListItemPermissionsByIds -SiteUrl $SiteUrl -ListId $ListId -ItemId $ItemId -GraphAccessToken $graphToken.AccessToken
+	if (-not $resp -or -not $resp.Permissions) { return @() }
+	$itemUrl = $resp.ItemWebUrl
+	$rows = @()
+	foreach ($p in $resp.Permissions) {
+		if (-not $p.link) { continue }
+		$scope = $p.link.scope
+		$roles = @(); foreach ($r in $p.roles) { $roles += [string]$r }
+		$roleStr = ($roles -join ' | ')
+		$accessible = $false
+		if ($scope -eq 'anonymous' -or $scope -eq 'organization') { $accessible = $true }
+		elseif ($scope -eq 'users') {
+			try {
+				if ($p.grantedToIdentitiesV2) {
+					foreach ($gi in $p.grantedToIdentitiesV2) {
+						if ($gi.user -and $userId -and ($gi.user.id -eq $userId)) { $accessible = $true; break }
+						if ($gi.group -and $UserGroups -and $UserGroups.GroupId -contains $gi.group.id) { $accessible = $true; break }
+					}
+				}
+			} catch { }
+		}
+		if ($accessible) {
+			$rows += [PSCustomObject]@{
+				ItemUrl = $itemUrl
+				Permission = $roleStr
+				Scope = $scope
+			}
+		}
+	}
+	return $rows
+}
+function Get-GraphDriveItemPermissions {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $ServerRelativeFileRef,
+		[Parameter(Mandatory = $true)] [string] $GraphAccessToken
+	)
+
+	try {
+		$siteUri = [Uri]$SiteUrl
+		$siteHost = $siteUri.Host
+		$sitePath = $siteUri.AbsolutePath
+		if ([string]::IsNullOrWhiteSpace($sitePath)) { $sitePath = '/' }
+		# Resolve Graph site id
+		$siteIdResp = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/sites/$($siteHost):$($sitePath)?$select=id,webUrl" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		$siteId = $siteIdResp.id
+		if (-not $siteId) { return $null }
+		# Compute drive and item paths
+		$sr = $ServerRelativeFileRef
+		# Ensure server relative begins with sitePath
+		if (-not $sr.StartsWith($sitePath, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+		$afterSite = $sr.Substring($sitePath.Length).TrimStart('/')
+		$firstSlash = $afterSite.IndexOf('/')
+		if ($firstSlash -lt 0) { $libraryName = $afterSite; $restPath = '' } else { $libraryName = $afterSite.Substring(0, $firstSlash); $restPath = $afterSite.Substring($firstSlash + 1) }
+		# Find the drive matching the library
+		$drives = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/drives?$select=id,name,webUrl" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		$drive = $null
+		foreach ($d in $drives.value) { if ($d.name -eq $libraryName -or ($d.webUrl -and $d.webUrl -match [Regex]::Escape($libraryName))) { $drive = $d; break } }
+		if (-not $drive) { return $null }
+		# Resolve item id
+		if ([string]::IsNullOrWhiteSpace($restPath)) {
+			$item = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/drives/$($drive.id)/root?$select=id,webUrl" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		} else {
+			$encodedPath = [System.Web.HttpUtility]::UrlPathEncode($restPath)
+			$item = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/drives/$($drive.id)/root:/$([uri]::EscapeDataString($restPath))?$select=id,webUrl" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		}
+		if (-not $item -or -not $item.id) { return $null }
+		# Get permissions
+		$perms = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/drives/$($drive.id)/items/$($item.id)/permissions" -Method GET -Headers @{ Authorization = "Bearer $GraphAccessToken" } -ErrorAction Stop | ConvertFrom-Json
+		return @{ ItemWebUrl = $item.webUrl; Permissions = $perms.value }
+	} catch { return $null }
+}
+
+function Get-UserAccessibleSharingLinksForItem {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $ServerRelativeFileRef,
+		[Parameter(Mandatory = $true)] [string] $UserEmail,
+		[Parameter(Mandatory = $true)] [object] $UserGroups
+	)
+
+	$graphToken = Get-GraphToken
+	$userId = Get-GraphUserObjectId -UserEmail $UserEmail
+	if (-not $graphToken -or -not $graphToken.AccessToken) { return @() }
+	$resp = Get-GraphDriveItemPermissions -SiteUrl $SiteUrl -ServerRelativeFileRef $ServerRelativeFileRef -GraphAccessToken $graphToken.AccessToken
+	if (-not $resp -or -not $resp.Permissions) { return @() }
+	$itemUrl = $resp.ItemWebUrl
+	$rows = @()
+	foreach ($p in $resp.Permissions) {
+		if (-not $p.link) { continue }
+		$scope = $p.link.scope
+		$roles = @(); foreach ($r in $p.roles) { $roles += [string]$r }
+		$roleStr = ($roles -join ' | ')
+		$accessible = $false
+		if ($scope -eq 'anonymous' -or $scope -eq 'organization') { $accessible = $true }
+		elseif ($scope -eq 'users') {
+			# Check if granted to this user or any of their AAD groups
+			try {
+				if ($p.grantedToIdentitiesV2) {
+					foreach ($gi in $p.grantedToIdentitiesV2) {
+						if ($gi.user -and $userId -and ($gi.user.id -eq $userId)) { $accessible = $true; break }
+						if ($gi.group -and $UserGroups -and $UserGroups.GroupId -contains $gi.group.id) { $accessible = $true; break }
+					}
+				}
+			} catch { }
+		}
+		if ($accessible) {
+			$rows += [PSCustomObject]@{
+				ItemUrl = $itemUrl
+				Permission = $roleStr
+				Scope = $scope
+			}
+		}
+	}
+	return $rows
 }
 
 function Get-SharePointAccessToken {
@@ -221,6 +403,7 @@ function New-CsvFile {
         GroupName         = $null
         PermissionLevel   = $null
         ListName          = $null
+        ItemUrl           = $null
         ListPermission    = $null
         TotalRuntimeSeconds = $null
     }
@@ -344,6 +527,168 @@ function Invoke-SharePointRestWithAcceptFallback {
 	}
 
 	throw "Received 406 Not Acceptable from $Uri after $Max406Retries retries."
+}
+
+function Resolve-SharingLinkPrincipalToItemUrl {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $AccessToken,
+		[Parameter(Mandatory = $true)] [string] $PrincipalTitle
+	)
+
+	# Extract GUID from principal title (e.g., SharingLinks.<GUID>)
+	$guidMatch = [regex]::Match($PrincipalTitle, '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
+	if (-not $guidMatch.Success) { return $null }
+	$linkGuid = $guidMatch.Groups[1].Value
+
+	$headers = @{ Authorization = "Bearer $AccessToken"; Accept = 'application/json;odata=nometadata' }
+	try {
+		$fileResp = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/GetFileById(guid'$linkGuid')") -BaseHeaders $headers -Method GET
+		if ($fileResp -and $fileResp.ServerRelativeUrl) {
+			$su = [Uri]$SiteUrl
+			return "$($su.Scheme)://$($su.Host)$($fileResp.ServerRelativeUrl)"
+		}
+	} catch { }
+	try {
+		$folderResp = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/GetFolderById(guid'$linkGuid')") -BaseHeaders $headers -Method GET
+		if ($folderResp -and $folderResp.ServerRelativeUrl) {
+			$su = [Uri]$SiteUrl
+			return "$($su.Scheme)://$($su.Host)$($folderResp.ServerRelativeUrl)"
+		}
+	} catch { }
+
+	# Fallback: Search by UniqueId for the path (fast and indexed)
+	try {
+		$searchUri = "$SiteUrl/_api/search/query?querytext='UniqueId:$linkGuid'&selectproperties='Path'&rowlimit=1"
+		$searchResp = Invoke-SharePointRestWithAcceptFallback -Uri $searchUri -BaseHeaders $headers -Method GET
+		if ($searchResp -and $searchResp.PrimaryQueryResult -and $searchResp.PrimaryQueryResult.RelevantResults -and $searchResp.PrimaryQueryResult.RelevantResults.Table) {
+			foreach ($row in $searchResp.PrimaryQueryResult.RelevantResults.Table.Rows) {
+				$props = @{}
+				foreach ($cell in $row.Cells) { $props[$cell.Key] = $cell.Value }
+				if ($props['Path']) { return [string]$props['Path'] }
+			}
+		}
+	} catch { }
+	return $null
+}
+
+function Search-ItemsSharedWithUserRest {
+	param(
+		[Parameter(Mandatory = $true)] [string] $UserEmail,
+		[Parameter(Mandatory = $false)] [string] $FilterSiteUrl
+	)
+
+	# Build certificate
+	if ($CertificatePassword) {
+		$passwordBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertificatePassword)
+		try { $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordBstr) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBstr) }
+		$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $plainPassword)
+	} else {
+		$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+	}
+
+	$adminHost = "$TenantName-admin.sharepoint.com"
+	$spoToken = Get-MsalToken -TenantId "$TenantName.onmicrosoft.com" -ClientId $ClientId -ClientCertificate $certificate -Scopes "https://$adminHost/.default"
+	$headers = @{ Authorization = "Bearer $($spoToken.AccessToken)"; Accept = 'application/json;odata=nometadata' }
+
+	# Construct robust identity token set for search (email, guest UPN, membership claim)
+	$userTokens = New-Object System.Collections.Generic.List[string]
+	$ue = ($UserEmail.Trim()).ToLowerInvariant()
+	if (-not [string]::IsNullOrWhiteSpace($ue)) { [void]$userTokens.Add($ue) }
+	try {
+		$gt = Get-GraphToken
+		if ($gt -and $gt.AccessToken) {
+			$encoded = [System.Web.HttpUtility]::UrlEncode($UserEmail)
+			$u = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/users/$encoded?$select=userPrincipalName" -Method GET -Headers @{ Authorization = "Bearer $($gt.AccessToken)" } -ErrorAction SilentlyContinue | ConvertFrom-Json
+			if ($u -and $u.userPrincipalName) {
+				$upnLower = ($u.userPrincipalName).ToLowerInvariant()
+				if (-not [string]::IsNullOrWhiteSpace($upnLower)) { [void]$userTokens.Add($upnLower) }
+			}
+		}
+	} catch { }
+	# Add membership claim variants
+	$claimTokens = New-Object System.Collections.Generic.List[string]
+	foreach ($tok in $userTokens) { [void]$claimTokens.Add("i:0#.f|membership|$tok") }
+
+	# Build KQL
+	$kqlParts = New-Object System.Collections.Generic.List[string]
+    foreach ($tok in $userTokens) { [void]$kqlParts.Add(('SharedWithUsersOWSUSER="' + $tok + '"')) }
+    foreach ($ctok in $claimTokens) { [void]$kqlParts.Add(('SharedWithUsersOWSUSER="' + $ctok + '"')) }
+	$kqlIdentity = '(' + ([string]::Join(' OR ', $kqlParts)) + ')'
+	$kql = "$kqlIdentity AND contentclass:STS_ListItem_DocumentLibrary"
+    if ($FilterSiteUrl) {
+        # Constrain to current site path to reduce noise
+        $kql += (' AND path="' + $FilterSiteUrl + '"')
+    }
+	$q = [System.Web.HttpUtility]::UrlEncode($kql)
+
+	$startRow = 0
+	$rowLimit = 500
+	$items = New-Object System.Collections.Generic.List[object]
+	$more = $true
+	while ($more) {
+		$uri = "https://$adminHost/_api/search/query?querytext='$q'&rowlimit=$rowLimit&startrow=$startRow&trimduplicates=false&selectproperties='Path,UniqueId'"
+		$response = Invoke-SharePointRestWithAcceptFallback -Uri $uri -BaseHeaders $headers -Method GET
+		$results = $response.PrimaryQueryResult.RelevantResults
+		if ($results -and $results.Table -and $results.Table.Rows) {
+			foreach ($row in $results.Table.Rows) {
+				$props = @{}
+				foreach ($cell in $row.Cells) { $props[$cell.Key] = $cell.Value }
+				if ($props.ContainsKey('Path') -and $props['Path']) {
+					$item = [PSCustomObject]@{ ItemUrl = [string]$props['Path'] }
+					[void]$items.Add($item)
+				}
+			}
+		}
+		$startRow += $rowLimit
+		$more = ($results -and $results.TotalRows -gt $startRow)
+	}
+
+	return $items
+}
+
+function Get-ItemSharingLinksRest {
+	param(
+		[Parameter(Mandatory = $true)] [string] $ItemUrl,
+		[Parameter(Mandatory = $true)] [string] $AccessToken
+	)
+
+	try {
+		$uri = [Uri]$ItemUrl
+		$apiBase = "$($uri.Scheme)://$($uri.Host)/_api/SP.Sharing.DocumentSharingManager.GetObjectSharingInformation"
+		$headers = @{ Authorization = "Bearer $AccessToken"; Accept = 'application/json;odata=nometadata'; 'Content-Type' = 'application/json;odata=nometadata' }
+		$body = @{ resourceAddress = $ItemUrl; groupId = 0; useSimplifiedRoles = $true; useAppTokenOnly = $true } | ConvertTo-Json -Depth 5
+		$resp = Invoke-RestMethod -Method POST -Uri $apiBase -Headers $headers -Body $body -ErrorAction Stop
+		return $resp
+	} catch { return $null }
+}
+
+function Try-ResolveSharingLinkBySamplingItems {
+	param(
+		[Parameter(Mandatory = $true)] [string] $SiteUrl,
+		[Parameter(Mandatory = $true)] [string] $ListId,
+		[Parameter(Mandatory = $true)] [string] $PrincipalTitle,
+		[Parameter(Mandatory = $true)] [int] $MaxScan,
+		[Parameter(Mandatory = $true)] [string] $AccessToken
+	)
+
+	$headers = @{ Authorization = "Bearer $AccessToken"; Accept = 'application/json;odata=nometadata' }
+	try {
+		$endpoint = "$SiteUrl/_api/web/lists(guid'$ListId')/items?`$select=Id,FileRef,HasUniqueRoleAssignments,RoleAssignments/Member/Title&`$filter=HasUniqueRoleAssignments%20eq%20true&`$expand=RoleAssignments,RoleAssignments/Member&`$top=$MaxScan"
+		$response = Invoke-SharePointRestWithAcceptFallback -Uri $endpoint -BaseHeaders $headers -Method GET
+		$items = @()
+		if ($response) { if ($response.value) { $items = $response.value } else { $items = @($response) } }
+		foreach ($i in $items) {
+			if (-not $i.RoleAssignments) { continue }
+			foreach ($ra in $i.RoleAssignments) {
+				if ($ra.Member -and $ra.Member.Title -eq $PrincipalTitle) {
+					$su = [Uri]$SiteUrl
+					if ($i.FileRef) { return "$($su.Scheme)://$($su.Host)$($i.FileRef)" }
+				}
+			}
+		}
+	} catch { }
+	return $null
 }
 
 function Get-UserOneDriveSiteUrl {
@@ -529,6 +874,7 @@ function Process-SiteForRetry {
                         GroupName         = $null
                         PermissionLevel   = $null
                         ListName          = $null
+						ItemUrl           = $null
                         ListPermission    = $null
                         TotalRuntimeSeconds = $null
                     }
@@ -552,7 +898,7 @@ function Process-SiteForRetry {
                 $groupTitle = [string]$group.Title
                 if ($groupTitle -match "Limited Access|_catalog") { continue }
 
-                if ($groupTitle -like 'SharingLinks.*') {
+                if ($groupTitle -match '(?i)^\s*Sharing\s*Links') {
                     $matchingAssignments = @()
                     if ($webRoleAssignments) { $matchingAssignments = $webRoleAssignments | Where-Object { $_.Member -and ($_.Member.Title -eq $groupTitle) } }
                     $permSet = New-Object System.Collections.Generic.HashSet[string]
@@ -566,6 +912,7 @@ function Process-SiteForRetry {
                         GroupName         = $groupTitle
                         PermissionLevel   = $permString
                         ListName          = $null
+						ItemUrl           = $null
                         ListPermission    = $null
                         TotalRuntimeSeconds = $null
                     }
@@ -596,6 +943,7 @@ function Process-SiteForRetry {
                         GroupName         = $groupTitle
                         PermissionLevel   = $permString
                         ListName          = $null
+						ItemUrl           = $null
                         ListPermission    = $null
                         TotalRuntimeSeconds = $null
                     }
@@ -603,13 +951,15 @@ function Process-SiteForRetry {
             }
         } catch { }
 
-        # Lists with unique permissions
+        # Lists (document libraries only)
         try {
-            $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/lists?`$select=Id,Title,HasUniqueRoleAssignments&`$top=5000") -BaseHeaders $headers -Method GET
+            $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/lists?`$select=Id,Title,BaseTemplate,Hidden&`$filter=BaseTemplate%20eq%20101%20and%20Hidden%20eq%20false&`$top=5000") -BaseHeaders $headers -Method GET
             $lists = @()
             if ($listsResponse) { if ($listsResponse.value) { $lists = $listsResponse.value } else { $lists = @($listsResponse) } }
             foreach ($list in $lists) {
-                if (-not $list.HasUniqueRoleAssignments) { continue }
+                # List-level role assignments (only if list itself has unique permissions)
+                try {
+                    if ($list.HasUniqueRoleAssignments -eq $true) {
                 $assignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$SiteUrl/_api/web/lists(guid'$($list.Id)')/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headers -Method GET
                 $assignments = @()
                 if ($assignmentsResponse) { if ($assignmentsResponse.value) { $assignments = $assignmentsResponse.value } else { $assignments = @($assignmentsResponse) } }
@@ -626,6 +976,7 @@ function Process-SiteForRetry {
                             GroupName         = $null
                             PermissionLevel   = $null
                             ListName          = $list.Title
+                                    ItemUrl           = $null
                             ListPermission    = $permString
                             TotalRuntimeSeconds = $null
                         }
@@ -634,6 +985,10 @@ function Process-SiteForRetry {
                         $permNames = @(); foreach ($b in $ra.RoleDefinitionBindings) { $permNames += $b.Name }
                         $permString = ($permNames -join ' | ')
                         if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+                                $resolvedItemUrl = $null
+                                if ($ResolveItemSharingLinks) {
+                                    $resolvedItemUrl = Resolve-SharingLinkPrincipalToItemUrl -SiteUrl $SiteUrl -AccessToken $SpoAccessToken -PrincipalTitle $ra.Member.Title
+                                }
                         $results += [PSCustomObject]@{
                             UserPrincipalName = $UserEmail
                             SiteUrl           = $SiteUrl
@@ -641,11 +996,17 @@ function Process-SiteForRetry {
                             GroupName         = $ra.Member.Title
                             PermissionLevel   = $permString
                             ListName          = $list.Title
+                                    ItemUrl           = $resolvedItemUrl
                             ListPermission    = $permString
                             TotalRuntimeSeconds = $null
                         }
                     }
                 }
+                    }
+                } catch { }
+
+                # Items with unique permissions (capture human-readable sharing link targets), REST-filtered and paged
+                try { } catch { }
             }
         } catch { }
     } catch { }
@@ -911,6 +1272,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
             GroupName         = $null
             PermissionLevel   = $null
             ListName          = $null
+            ItemUrl           = $null
             ListPermission    = $null
             TotalRuntimeSeconds = $null
         }
@@ -946,7 +1308,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
     }
 
                         # Special handling for SharingLinks principals at web scope
-                        if ($groupTitle -like 'SharingLinks.*') {
+                        if ($groupTitle -match '(?i)^\s*Sharing\s*Links') {
                             try {
                                 $matchingAssignments = @()
                                 if ($webRoleAssignments) { $matchingAssignments = $webRoleAssignments | Where-Object { $_.Member -and ($_.Member.Title -eq $groupTitle) } }
@@ -956,6 +1318,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                                 }
                                 $permString = (($permSet.ToArray()) -join ' | ')
                                 if ([string]::IsNullOrWhiteSpace($permString)) { $permString = 'No Permissions' }
+                                $resolvedItemUrl = $null
 
                                 if ($localIsQuiet -and $localLog) {
                                     [void]$sync.LogLines.Add("$(Get-Date) INFO: `t$localUserEmail sharing link $groupTitle has $permString at site level.")
@@ -969,6 +1332,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                                     GroupName         = $groupTitle
                                     PermissionLevel   = $permString
                 ListName          = $null
+                ItemUrl           = $resolvedItemUrl
                 ListPermission    = $null
                 TotalRuntimeSeconds = $null
             }
@@ -1027,6 +1391,7 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                                 GroupName         = $groupTitle
                                 PermissionLevel   = $permString
                 ListName          = $null
+                ItemUrl           = $null
                 ListPermission    = $null
                 TotalRuntimeSeconds = $null
             }
@@ -1064,15 +1429,14 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                     "Workflow History", "Workflow Tasks", "Preservation Hold Library", 
                     "SharePointHomeCacheList")
 
-                # Get lists with HasUniqueRoleAssignments flag
-                $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists?`$select=Id,Title,HasUniqueRoleAssignments&`$top=5000") -BaseHeaders $headersLists -Method GET
+                # Document libraries only for performance
+                $listsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists?`$select=Id,Title,HasUniqueRoleAssignments,BaseTemplate,Hidden&`$filter=BaseTemplate%20eq%20101%20and%20Hidden%20eq%20false&`$top=5000") -BaseHeaders $headersLists -Method GET
                 $lists = @()
                 if ($listsResponse) { if ($listsResponse.value) { $lists = $listsResponse.value } else { $lists = @($listsResponse) } }
 
                 foreach ($list in $lists) {
                     try {
                         if ($excludedLists -contains $list.Title) { continue }
-                        if (-not $list.HasUniqueRoleAssignments) { continue }
 
                         # Get role assignments for the list
                         $assignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists(guid'$($list.Id)')/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headersLists -Method GET
@@ -1100,17 +1464,25 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                 GroupName         = $null
                 PermissionLevel   = $null
                                     ListName          = $list.Title
+                                    ItemUrl           = $null
                                     ListPermission    = $permissionString
                 TotalRuntimeSeconds = $null
             }
                             }
 
                             # Include SharingLinks principals at list scope
-                            if ($roleAssignment.Member -and $roleAssignment.Member.Title -like 'SharingLinks.*') {
+                            if ($roleAssignment.Member -and ($roleAssignment.Member.Title -match '(?i)^\s*Sharing\s*Links')) {
                                 $permissionNames = @()
                                 foreach ($binding in $roleAssignment.RoleDefinitionBindings) { $permissionNames += $binding.Name }
                                 $permissionString = $permissionNames -join " | "
                                 if ([string]::IsNullOrWhiteSpace($permissionString)) { $permissionString = 'No Permissions' }
+                                $resolvedItemUrl = $null
+                                if ($using:ResolveItemSharingLinks) {
+                                    $resolvedItemUrl = Resolve-SharingLinkPrincipalToItemUrl -SiteUrl $site.Url -AccessToken $using:SpoAccessToken -PrincipalTitle $roleAssignment.Member.Title
+                                    if (-not $resolvedItemUrl) {
+                                        $resolvedItemUrl = Try-ResolveSharingLinkBySamplingItems -SiteUrl $site.Url -ListId $list.Id -PrincipalTitle $roleAssignment.Member.Title -MaxScan $using:MaxItemScanPerList -AccessToken $using:SpoAccessToken
+                                    }
+                                }
 
                                 if ($localIsQuiet -and $localLog) {
                                     [void]$sync.LogLines.Add("$(Get-Date) INFO: `tSharing link $($roleAssignment.Member.Title) has $permissionString on list $($list.Title).")
@@ -1124,16 +1496,128 @@ $parallelResults = $siteCollections | ForEach-Object -Parallel {
                                     GroupName         = $roleAssignment.Member.Title
                                     PermissionLevel   = $permissionString
                 ListName          = $list.Title
+                ItemUrl           = $resolvedItemUrl
                 ListPermission    = $permissionString
                 TotalRuntimeSeconds = $null
             }
                             }
+                        }
+                        # Optional item-level enumeration to resolve item-level SharingLinks rows
+                        if ($using:ResolveItemSharingLinks) {
+                            try {
+                                $page = 0
+                                $next = "$($site.Url)/_api/web/lists(guid'$($list.Id)')/items?`$select=Id,FileRef,HasUniqueRoleAssignments&`$filter=HasUniqueRoleAssignments%20eq%20true&`$top=1000"
+                                while ($next -and ($page*1000) -lt $using:MaxItemScanPerList) {
+                                    $itemsResponse = Invoke-SharePointRestWithAcceptFallback -Uri $next -BaseHeaders $headersLists -Method GET
+                                    $items = @()
+                                    if ($itemsResponse) { if ($itemsResponse.value) { $items = $itemsResponse.value } else { $items = @($itemsResponse) } }
+                                    foreach ($item in $items) {
+                                        # For each item, fetch role assignments (cannot reliably expand via list item)
+                                        $itemAssignmentsResponse = Invoke-SharePointRestWithAcceptFallback -Uri ("$($site.Url)/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/roleassignments?`$expand=Member,RoleDefinitionBindings") -BaseHeaders $headersLists -Method GET
+                                        $itemAssignments = @()
+                                        if ($itemAssignmentsResponse) { if ($itemAssignmentsResponse.value) { $itemAssignments = $itemAssignmentsResponse.value } else { $itemAssignments = @($itemAssignmentsResponse) } }
+                                        foreach ($ra in $itemAssignments) {
+                                            if ($ra.Member -and ($ra.Member.Title -match '(?i)^\s*Sharing\s*Links')) {
+                                                $permissionNames = @()
+                                                if ($ra.RoleDefinitionBindings) { foreach ($b in $ra.RoleDefinitionBindings) { if ($b.Name) { $permissionNames += $b.Name } } }
+                                                $permissionString = $permissionNames -join ' | '
+                                                if ([string]::IsNullOrWhiteSpace($permissionString)) { $permissionString = 'No Permissions' }
+                                                $su = [Uri]$site.Url
+                                                $hostRoot = "$($su.Scheme)://$($su.Host)"
+                                                $itemUrlAbsolute = $null
+                                                if ($item.FileRef) { $itemUrlAbsolute = "$hostRoot$($item.FileRef)" }
+
+                                                $localResults += [PSCustomObject]@{
+                                                    UserPrincipalName = $localUserEmail
+                                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                                    GroupName         = $ra.Member.Title
+                                                    PermissionLevel   = $permissionString
+                ListName          = $list.Title
+                ItemUrl           = $itemUrlAbsolute
+                                                    ListPermission    = $null
+                TotalRuntimeSeconds = $null
+            }
+                                            }
+                                        }
+                                        # Graph-based check for user-accessible sharing links on this item
+                                        try {
+                                            if ($item.FileRef) {
+                                                $userLinks = Get-UserAccessibleSharingLinksForListItem -SiteUrl $site.Url -ListId $list.Id -ItemId $item.Id -UserEmail $localUserEmail -UserGroups $localUserGroups
+                                                foreach ($ul in $userLinks) {
+                                                    $localResults += [PSCustomObject]@{
+                                                        UserPrincipalName = $localUserEmail
+                                                        SiteUrl           = $site.Url
+                            SiteAdmin         = $false
+                                                        GroupName         = 'SharingLinks.Graph'
+                                                        PermissionLevel   = $ul.Permission
+                            ListName          = $list.Title
+                            ItemUrl           = $ul.ItemUrl
+                                                        ListPermission    = $null
+                            TotalRuntimeSeconds = $null
+                        }
+                                                }
+                                            }
+                                        } catch { }
+                                    }
+                                    $page++
+                                    $next = $null
+                                    if ($itemsResponse -and $itemsResponse.PSObject.Properties['@odata.nextLink']) { $next = [string]$itemsResponse.'@odata.nextLink' }
+                                }
+                            } catch { }
                         }
                     }
                     catch {
                         # Silently skip lists that cause errors (could be system lists)
                         continue
                     }
+                }
+                # Last resort: search for items shared with the user and add those links
+                if ($using:ResolveItemSharingLinks) {
+                    try {
+                        $sharedItems = Search-ItemsSharedWithUserRest -UserEmail $localUserEmail -FilterSiteUrl $site.Url
+                        foreach ($si in $sharedItems) {
+                            # Retrieve sharing information to populate permissions human-readably
+                            $sharingInfo = Get-ItemSharingLinksRest -ItemUrl $si.ItemUrl -AccessToken $using:SpoAccessToken
+                            $links = @()
+                            if ($sharingInfo) {
+                                if ($sharingInfo.links) { $links = $sharingInfo.links }
+                                elseif ($sharingInfo.SharingLinks) { $links = $sharingInfo.SharingLinks }
+                            }
+                            if (-not $links -or $links.Count -eq 0) {
+                                $localResults += [PSCustomObject]@{
+                                    UserPrincipalName = $localUserEmail
+                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                    GroupName         = 'SharingLinks.SearchDerived'
+                                    PermissionLevel   = $null
+                ListName          = $null
+                ItemUrl           = $si.ItemUrl
+                                    ListPermission    = $null
+                TotalRuntimeSeconds = $null
+            }
+                                continue
+                            }
+                            foreach ($link in $links) {
+                                $roles = @()
+                                if ($link.Roles) { foreach ($r in $link.Roles) { $roles += [string]$r } }
+                                elseif ($link.Role) { $roles += [string]$link.Role }
+                                $permString = ($roles -join ' | ')
+                                if ([string]::IsNullOrWhiteSpace($permString)) { $permString = $link.LinkKind }
+                                $localResults += [PSCustomObject]@{
+                                    UserPrincipalName = $localUserEmail
+                                    SiteUrl           = $site.Url
+                SiteAdmin         = $false
+                                    GroupName         = 'SharingLinks.SearchDerived'
+                                    PermissionLevel   = $permString
+                ListName          = $null
+                ItemUrl           = $si.ItemUrl
+                                    ListPermission    = $null
+                TotalRuntimeSeconds = $null
+            }
+                            }
+                        }
+                    } catch { }
                 }
             }
             catch {
@@ -1197,7 +1681,7 @@ Write-Major "$(Get-Date) INFO: Writing results to CSV..."
 $dedup = @{}
 foreach ($result in $parallelResults) {
     if ($result) {
-        $key = ("$($result.UserPrincipalName)|$($result.SiteUrl)|$($result.SiteAdmin)|$($result.GroupName)|$($result.PermissionLevel)|$($result.ListName)|$($result.ListPermission)")
+        $key = ("$($result.UserPrincipalName)|$($result.SiteUrl)|$($result.SiteAdmin)|$($result.GroupName)|$($result.PermissionLevel)|$($result.ListName)|$($result.ItemUrl)|$($result.ListPermission)")
         if (-not $dedup.ContainsKey($key)) {
             $dedup[$key] = $true
             $result | Export-Csv -Path $CSVPath -Append -NoTypeInformation
@@ -1218,6 +1702,7 @@ $csvLineObject = [PSCustomObject]@{
     GroupName           = $null
     PermissionLevel     = $null
     ListName            = $null
+    ItemUrl             = $null
     ListPermission      = $null
     TotalRuntimeSeconds = $totalSeconds
 }
